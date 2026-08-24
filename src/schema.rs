@@ -596,15 +596,16 @@ fn validate(
                     uses.cascading.insert(n.clone());
                 }
                 // Sharing is what lets `array A[N]` and `array B[N]` coexist:
-                // one axis, one selection, both projected together. A vertex
-                // count is the exception -- selecting vertices also drops
-                // edges, which changes a *different* count, and that
-                // propagation does not exist yet.
+                // one axis, one selection, both projected together. A graph's
+                // vertex selection additionally induces one on its edge axis,
+                // which is handled. A tree's is not: pruning runs a sequence of
+                // selections against a changing leaf set, and fanning that out
+                // to co-sized members is a separate job.
                 if shared && uses.cascading.contains(n) {
                     return Err(format!(
-                        "`{n}` is used as a vertex count and also sizes something else; \
-                         selecting vertices changes the edge count too, and that is not \
-                         propagated yet"
+                        "`{n}` is a tree's vertex count and also sizes something else; tree \
+                         pruning is a sequence of selections against a changing leaf set, and \
+                         fanning that out is not implemented yet"
                     ));
                 }
                 Ok(())
@@ -624,7 +625,9 @@ fn validate(
             Decl::Tree { name, verts } => use_count(verts, "vertex count", name, true)?,
             Decl::Graph { name, edges, verts } => {
                 use_count(edges, "edge count", name, false)?;
-                use_count(verts, "vertex count", name, true)?;
+                // A graph vertex selection induces one on the edge axis, so
+                // sharing it is fine.
+                use_count(verts, "vertex count", name, false)?;
             }
             Decl::Repeat { count, body } => {
                 use_count(count, "repeat count", "repeat", false)?;
@@ -1384,19 +1387,92 @@ fn occurrences(
     }
 }
 
+/// The edge positions that survive a vertex selection: those whose endpoints
+/// both remain.
+///
+/// Derived from the **original** edge list and the selected vertex positions,
+/// never from an already-projected graph. That ordering is what makes this an
+/// induced selection rather than a recomputation.
+fn induced_edge_keep(graph: &GraphCase, vertex_keep: &[usize]) -> Vec<usize> {
+    let mut alive = vec![false; graph.n + 1];
+    for &position in vertex_keep {
+        if position < graph.n {
+            alive[position + 1] = true;
+        }
+    }
+    graph
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| alive[e.u] && alive[e.v])
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Build the candidate in which this occurrence keeps only `keep`.
 ///
 /// Every member is projected with the *same* mask, which is what makes a shared
 /// dimension stay consistent: the declarations cannot disagree because they are
 /// never asked separately.
-fn project_occurrence(data: &SchemaData, occ: &Occurrence, keep: &[usize]) -> Option<SchemaData> {
+fn project_occurrence(
+    data: &SchemaData,
+    occ: &Occurrence,
+    keep: &[usize],
+    siblings: &[Occurrence],
+) -> Option<SchemaData> {
+    let schema = Rc::clone(&data.schema);
     let mut trial = data.clone();
+    let mut written: Vec<Path> = Vec::new();
+    // Selections this projection induces on *other* occurrences in the same
+    // block instantiation. The first concrete instance of
+    //     selection on occurrence A  ->  induced selection on occurrence B
+    let mut induced: Vec<(AxisId, Vec<usize>)> = Vec::new();
+
     for member in &occ.members {
         let path = occ.path_of(member);
-        let current = value_at(&trial.values, &path)?;
-        let projected = project_member(current, member.role, keep)?;
+        let current = value_at(&trial.values, &path)?.clone();
+
+        if member.role == Role::GraphVertices {
+            if let (Value::Graph(graph), Some(Decl::Graph { edges, .. })) =
+                (&current, decl_at(&schema.items, &path))
+            {
+                if let Some(edge_axis) = schema.sizing_axis(edges) {
+                    induced.push((edge_axis, induced_edge_keep(graph, keep)));
+                }
+            }
+        }
+
+        let projected = project_member(&current, member.role, keep)?;
         put(&mut trial, &path, projected);
+        written.push(path);
     }
+
+    // Induction happens once, at the occurrence, and fans out to every member.
+    // No declaration recomputes a mask of its own.
+    for (axis, edge_keep) in induced {
+        let Some(target) = siblings.iter().find(|o| o.axis == axis) else {
+            continue;
+        };
+        debug_assert_eq!(
+            target.prefix, occ.prefix,
+            "induction escaped its block instantiation"
+        );
+        for member in &target.members {
+            let path = target.path_of(member);
+            if written.contains(&path) {
+                // The graph's own edge list was already projected alongside its
+                // vertices, because one `Value::Graph` holds both.
+                continue;
+            }
+            let current = value_at(&trial.values, &path)?.clone();
+            let projected = project_member(&current, member.role, &edge_keep)?;
+            put(&mut trial, &path, projected);
+            written.push(path);
+        }
+    }
+
+    // Downstream bookkeeping only: resync observes members that are already
+    // consistent, it does not decide which positions survived.
     trial.resync();
     Some(trial)
 }
@@ -1408,6 +1484,12 @@ fn shrink_occurrence(
 ) -> bool {
     let schema = Rc::clone(&data.schema);
     let bounds = schema.axis_bounds(occ.axis);
+    // Occurrences an induced selection may reach: the same block instantiation.
+    let siblings: Vec<Occurrence> = data
+        .all_occurrences()
+        .into_iter()
+        .filter(|o| o.prefix == occ.prefix)
+        .collect();
 
     // A tree may only shed leaves, so it runs a constrained sequence of
     // selections rather than one. Validation keeps it a sole member.
@@ -1428,7 +1510,7 @@ fn shrink_occurrence(
     }
 
     let positions: Vec<usize> = (0..extent).collect();
-    let mut test = |candidate: &[usize]| match project_occurrence(data, occ, candidate) {
+    let mut test = |candidate: &[usize]| match project_occurrence(data, occ, candidate, &siblings) {
         Some(trial) => accept(&trial),
         None => false,
     };
@@ -1443,7 +1525,7 @@ fn shrink_occurrence(
     if kept.len() == extent {
         return false;
     }
-    match project_occurrence(data, occ, &kept) {
+    match project_occurrence(data, occ, &kept, &siblings) {
         Some(next) => {
             *data = next;
             true
@@ -1781,24 +1863,250 @@ mod tests {
         assert_eq!(survivors[1], (vec![0], vec![-9]));
     }
 
-    /// Sharing is legal; sharing a *vertex* count is not, yet. Selecting
-    /// vertices also drops edges, which changes a different count, and that
-    /// propagation does not exist. Rejected with an explanation rather than
-    /// silently desynchronising.
-    #[test]
-    fn sharing_a_vertex_count_is_rejected_with_a_reason() {
-        let err = parse_schema(
-            "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\narray W[N] in 0..9\n",
-        )
-        .unwrap_err();
-        assert!(err.contains("not propagated yet"), "{err}");
+    /// The occurrence a graph's vertices live on, plus the occurrences an
+    /// induced selection may reach.
+    fn vertex_occurrence(data: &SchemaData) -> (Occurrence, Vec<Occurrence>) {
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let occ = all
+            .iter()
+            .find(|o| o.members.iter().any(|m| m.role == Role::GraphVertices))
+            .expect("a vertex occurrence")
+            .clone();
+        let siblings = all
+            .iter()
+            .filter(|o| o.prefix == occ.prefix)
+            .cloned()
+            .collect();
+        (occ, siblings)
+    }
 
-        // The other order is caught too.
-        let err = parse_schema(
-            "int N in 1..10\nint M in 0..20\narray W[N] in 0..9\ngraph E[M] vertices N\n",
-        )
-        .unwrap_err();
-        assert!(err.contains("not propagated yet"), "{err}");
+    fn graph_of(data: &SchemaData, at: usize) -> &GraphCase {
+        match &data.values[at] {
+            Value::Graph(g) => g,
+            other => panic!("expected a graph, got {other:?}"),
+        }
+    }
+
+    /// The section 5 example. A vertex selection induces a selection on the
+    /// *edge* axis, and that induced selection projects every member of the
+    /// edge axis -- not just the graph that produced it.
+    #[test]
+    fn a_vertex_selection_induces_the_edge_selection_and_fans_it_out() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                    array W[M] in 0..99\n";
+        let data = build(text, "5 5\n1 2\n2 3\n3 4\n4 5\n1 5\n10 20 30 40 50\n");
+
+        // Keep vertices 1, 2, 4, 5 (positions 0, 1, 3, 4). Edges (2,3) and
+        // (3,4) each lose an endpoint, so the survivors are positions 0, 3 and
+        // 4 -- deliberately non-contiguous.
+        assert_eq!(
+            induced_edge_keep(graph_of(&data, 2), &[0, 1, 3, 4]),
+            vec![0, 3, 4]
+        );
+
+        let (occ, siblings) = vertex_occurrence(&data);
+        let projected = project_occurrence(&data, &occ, &[0, 1, 3, 4], &siblings).unwrap();
+
+        // N M, three relabelled edges, then exactly the surviving weights.
+        assert_eq!(
+            ints(&projected.render()),
+            vec![4, 3, 1, 2, 3, 4, 1, 4, 10, 40, 50]
+        );
+        assert_eq!(
+            parse_input(&projected.schema, &projected.render()).unwrap(),
+            projected
+        );
+    }
+
+    /// One induced mask, three members of the edge axis, one projection.
+    #[test]
+    fn an_induced_edge_selection_projects_every_member_identically() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                    array W[M] in 0..99\narray Label[M] in 0..99\n";
+        let data = build(
+            text,
+            "5 5\n1 2\n2 3\n3 4\n4 5\n1 5\n10 20 30 40 50\n71 72 73 74 75\n",
+        );
+
+        let (occ, siblings) = vertex_occurrence(&data);
+        let projected = project_occurrence(&data, &occ, &[0, 1, 3, 4], &siblings).unwrap();
+
+        let (Value::Array(w), Value::Array(label)) = (&projected.values[3], &projected.values[4])
+        else {
+            panic!("expected two arrays")
+        };
+        // Both took positions 0, 3, 4 -- the same induced mask, not two masks.
+        assert_eq!(w, &vec![10, 40, 50]);
+        assert_eq!(label, &vec![71, 74, 75]);
+        assert_eq!(graph_of(&projected, 2).edges.len(), w.len());
+        assert_eq!(
+            parse_input(&projected.schema, &projected.render()).unwrap(),
+            projected
+        );
+    }
+
+    /// The adversarial version: the same graph declaration in two repeat
+    /// instances, whose vertex selections induce *different* edge masks.
+    /// Anything cached against the static edge `AxisId` reuses the first.
+    #[test]
+    fn induction_stays_inside_its_own_repeat_instance() {
+        let text = "int T in 1..3\nrepeat T {\n  int N in 1..10\n  int M in 0..20\n  \
+                    graph E[M] vertices N\n  array W[M] in 0..99\n}\n";
+        // Instance 0 needs weight 30, instance 1 needs weight 61.
+        let data = build(
+            text,
+            "2\n3 3\n1 2\n2 3\n1 3\n10 20 30\n3 3\n1 2\n2 3\n1 3\n60 61 62\n",
+        );
+
+        let reduced = reduce(&data, |t| {
+            let v = ints(t);
+            v.contains(&30) && v.contains(&61)
+        });
+
+        let Value::Repeat(iters) = &reduced.values[1] else {
+            panic!("expected a repeat")
+        };
+        assert_eq!(iters.len(), 2);
+        for (k, iter) in iters.iter().enumerate() {
+            let (Value::Int(n), Value::Int(m), Value::Graph(g), Value::Array(w)) =
+                (&iter[0], &iter[1], &iter[2], &iter[3])
+            else {
+                panic!("unexpected shape in instance {k}")
+            };
+            assert_eq!(g.edges.len(), w.len(), "instance {k}: W lost sync with E");
+            assert_eq!(*m, w.len() as i64, "instance {k}: M disagrees");
+            assert_eq!(*n, g.n as i64, "instance {k}: N disagrees");
+            for e in &g.edges {
+                assert!(e.u >= 1 && e.u <= g.n && e.v >= 1 && e.v <= g.n);
+            }
+        }
+        // The two instances kept different weights, so different edge masks.
+        let weights: Vec<Vec<i64>> = iters
+            .iter()
+            .map(|iter| match &iter[3] {
+                Value::Array(w) => w.clone(),
+                _ => panic!(),
+            })
+            .collect();
+        assert!(weights[0].contains(&30));
+        assert!(weights[1].contains(&61));
+        assert_ne!(weights[0], weights[1]);
+
+        // Pinned exactly. The structural assertions above are not enough on
+        // their own: a mask replayed from another instance still projects E and
+        // W consistently with each other, so only the *identity* of the
+        // surviving edge gives it away.
+        assert_eq!(
+            ints(&reduced.render()),
+            vec![2, 2, 1, 1, 2, 30, 2, 1, 1, 2, 61],
+            "each instance must keep the edge its own predicate needs"
+        );
+        assert_eq!(
+            parse_input(&reduced.schema, &reduced.render()).unwrap(),
+            reduced
+        );
+    }
+
+    /// The same static edge `AxisId` in two instances, over graphs of different
+    /// shapes, induced with different vertex masks. Anything cached against the
+    /// axis identifier replays the first instance's mask onto the second.
+    #[test]
+    fn each_instance_induces_its_own_edge_mask() {
+        let text = "int T in 1..3\nrepeat T {\n  int N in 1..10\n  int M in 0..20\n  \
+                    graph E[M] vertices N\n  array W[M] in 0..99\n}\n";
+        // Instance 0 is a triangle, instance 1 a four-cycle.
+        let data = build(
+            text,
+            "2\n3 3\n1 2\n2 3\n1 3\n10 20 30\n4 4\n1 2\n2 3\n3 4\n1 4\n60 61 62 63\n",
+        );
+
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let vertex_occs: Vec<Occurrence> = all
+            .iter()
+            .filter(|o| o.members.iter().any(|m| m.role == Role::GraphVertices))
+            .cloned()
+            .collect();
+        assert_eq!(vertex_occs.len(), 2, "one vertex occurrence per instance");
+        assert_eq!(
+            vertex_occs[0].axis, vertex_occs[1].axis,
+            "the same static AxisId"
+        );
+        assert_ne!(
+            vertex_occs[0].prefix, vertex_occs[1].prefix,
+            "in different instantiations"
+        );
+
+        let instance_graph = |k: usize| -> GraphCase {
+            let Value::Repeat(iters) = &data.values[1] else {
+                panic!()
+            };
+            match &iters[k][2] {
+                Value::Graph(g) => g.clone(),
+                other => panic!("expected a graph, got {other:?}"),
+            }
+        };
+
+        // Keeping vertices 1,2 of the triangle leaves edge (1,2), position 0.
+        assert_eq!(induced_edge_keep(&instance_graph(0), &[0, 1]), vec![0]);
+        // Keeping vertices 3,4 of the four-cycle leaves edge (3,4), position 2.
+        assert_eq!(induced_edge_keep(&instance_graph(1), &[2, 3]), vec![2]);
+
+        let project = |k: usize, keep: &[usize]| {
+            let occ = &vertex_occs[k];
+            let siblings: Vec<Occurrence> = all
+                .iter()
+                .filter(|o| o.prefix == occ.prefix)
+                .cloned()
+                .collect();
+            project_occurrence(&data, occ, keep, &siblings).expect("projects")
+        };
+
+        let weights_of = |d: &SchemaData, k: usize| -> Vec<i64> {
+            let Value::Repeat(iters) = &d.values[1] else {
+                panic!()
+            };
+            match &iters[k][3] {
+                Value::Array(w) => w.clone(),
+                other => panic!("expected an array, got {other:?}"),
+            }
+        };
+
+        // Each instance keeps the weight of *its own* surviving edge, and the
+        // sibling instance is untouched.
+        let first = project(0, &[0, 1]);
+        assert_eq!(weights_of(&first, 0), vec![10]);
+        assert_eq!(weights_of(&first, 1), vec![60, 61, 62, 63]);
+
+        let second = project(1, &[2, 3]);
+        assert_eq!(weights_of(&second, 1), vec![62]);
+        assert_eq!(weights_of(&second, 0), vec![10, 20, 30]);
+    }
+
+    /// A graph's vertex count may now be shared, because the vertex selection
+    /// induces the edge one. A tree's may not: pruning is a sequence of
+    /// selections against a changing leaf set.
+    #[test]
+    fn graph_vertex_counts_may_be_shared_but_tree_ones_may_not() {
+        parse_schema("int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\narray D[N] in 0..9\n")
+            .expect("a graph vertex count is shareable");
+
+        let err =
+            parse_schema("int N in 2..10\ntree E vertices N\narray D[N] in 0..9\n").unwrap_err();
+        assert!(err.contains("not implemented yet"), "{err}");
     }
 
     #[test]

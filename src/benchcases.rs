@@ -262,6 +262,30 @@ repeat T {
         Pred::ContainsAll(&[7, -9]),
     );
 
+    // The section 5 example: a vertex selection induces an edge selection,
+    // which must project the weights too.
+    add(
+        "graph_weighted_edges",
+        Some(
+            "int N in 1..10
+int M in 0..20
+graph E[M] vertices N
+             array W[M] in 0..99
+",
+        ),
+        Shape::Auto,
+        "5 5
+1 2
+2 3
+3 4
+4 5
+1 5
+10 20 30 40 50
+"
+        .into(),
+        Pred::ContainsAll(&[10, 40]),
+    );
+
     // --- nested repeats --------------------------------------------------
     // The inner block axis occurs once per outer instance. The predicate needs
     // outer 0's second inner iteration and outer 1's first, so the two
@@ -537,6 +561,7 @@ fn corpus_covers_every_reduction_path() {
         "nested_repeat_occurrences",
         "shared_count_two_arrays",
         "shared_count_nested_instances",
+        "graph_weighted_edges",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

@@ -78,6 +78,7 @@ fails if one is dropped.
 | `nested_repeat_occurrences` | one axis occurring once per outer instance |
 | `shared_count_two_arrays` | one count, two collections, one mask |
 | `shared_count_nested_instances` | a shared axis selecting differently per instance |
+| `graph_weighted_edges` | a vertex selection inducing an edge selection |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with

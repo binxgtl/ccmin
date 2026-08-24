@@ -1,13 +1,16 @@
 # Shared dimensions — design note for v0.5
 
-Status: proposal, revision 6. Implementation under way (v0.5 step 1).
+Status: revision 7. Implementation under way; the vertex-to-edge cascade of
+§5 is built.
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
 count-shrink propagation and where independence lives. Revision 4 fixed two
 places revision 3 contradicted its own model. Revision 5 closed the cascade
 fixpoint over cardinality events. Revision 6 separates the static arena from
 runtime state, after checkpoint 3 of the implementation ran into it. What each
-revision got wrong is kept in §13 to §17 rather than folded in silently.
+revision got wrong is kept in §13 to §18 rather than folded in silently.
+Revision 7 separates an induced *selection* from a cardinality *requirement*,
+after the first real cascade made the difference concrete.
 
 Four sentences the implementation has to keep true throughout:
 
@@ -250,6 +253,27 @@ axis → reference          a target position disappears
 axis → relation → axis    a selection is made here
                           -> a selection is INDUCED there
 ```
+
+### Two kinds of induced obligation
+
+These look alike and are not, and collapsing them would be another "two things
+treated as one" of the sort §13 to §17 record:
+
+```text
+InducedSelection(axis occurrence, mask)   determines identity AND cardinality
+RequireCardinality(axis occurrence, k)    determines size only
+```
+
+A vertex selection induces a **selection** on the edge axis: not "keep two
+edges" but "keep edges 0, 3 and 4". Encoding it as a cardinality requirement
+would throw away which edges survived, and every member of that axis would then
+be free to keep a different two.
+
+A cardinality requirement is the weaker thing, and is what a count needs when
+two of its axes must end the same size without either determining the other's
+positions. It has no producer yet, which is why it is not implemented: the only
+cascade that exists is positional. It arrives with the first relation whose
+semantics really are "this many" rather than "these ones".
 
 For a bijection the edge is bidirectional (§9). The engine contract:
 
@@ -650,14 +674,24 @@ property of an array; it is which axis the array points at (§6).
 ## 10. Roadmap
 
 ```
-0. Freeze v0.4 with benchcases.
-1. Split Count / Axis / Reference in the representation. No syntax.
-2. Fix dependency-graph + fixpoint semantics (§4, §5).
-3. Port array / matrix / repeat.
-4. Port graph / tree onto Index + SelectionConstraint.
-5. Only then: decide whether shared N means same count or same axis,
-   and add the syntax to say which.
+0. Freeze v0.4 with benchcases.                              done
+1. Split Count / Axis / Reference in the representation.     done
+2. Make a selection belong to an axis occurrence.            done
+   Shared counts fall out: one mask, every member.
+3. Extract vertex -> edge positional induction.              done
+   The first real "selection on A induces selection on B".
+4. Minimal occurrence-local worklist around induced
+   selections. Keep it embarrassingly small.
+5. Index elements, generalising what graph endpoints are.
+6. RequireCardinality, once a relation induces only a size.
+7. Generalise validate / induce once two relation forms
+   exist to prove the abstraction.
 ```
+
+The order changed at step 3. Earlier revisions put `Index` before the cascade;
+building it first would have meant writing `induce` with no caller that
+enqueues anything. Extracting the one cascade that already existed gives the
+worklist something real to carry before it is written.
 
 Step 0 first is not optional. The refactor collapses seven reduction paths into
 one; without a fixed corpus asserting tokens-out and oracle-calls-out per case,
@@ -886,3 +920,46 @@ The reduced checkpoint 3 that follows does *not* introduce instance frames.
 Nothing in this failure shows that a runtime instance-addressing abstraction is
 required — only that cardinality must not be duplicated. Building frames now
 would fold two independently verifiable decisions into one change.
+
+---
+
+## 18. What implementing §5 exposed
+
+Not a modelling error this time -- a shipped bug and a naming risk, both found
+by writing the code.
+
+**The sharing restriction was aimed at the wrong role.** Step 2 allowed several
+declarations to share a count, and refused only *vertex* counts, on the grounds
+that a vertex selection also changes the edge count. The reasoning was right and
+the target was wrong: nothing stopped an *edge* count being shared, and that is
+the broken configuration. This schema passed validation:
+
+```text
+int N in 1..10
+int M in 0..20
+graph E[M] vertices N
+array W[M] in 0..99
+```
+
+and selecting vertices produced output that cannot re-parse -- `M` claiming four
+edges, one edge line, four weights -- because `resync` saw the graph say one and
+`W` say four, and the last write won. Exactly the failure §1 attributes to v0.4,
+reintroduced by allowing sharing before the cascade existed. Caught by probing
+the combination rather than by any test, which is the argument for probing a new
+capability's *interactions* and not only its intended use.
+
+Fixed by this checkpoint: the vertex selection now induces a positional
+selection on the edge axis, and that induced selection projects every member of
+it. Sharing a graph vertex count is legal as a result; a tree's is still not,
+because pruning is a sequence of selections against a changing leaf set.
+
+**Induced selections and cardinality requirements are different.** Recorded in
+§4. The temptation is to run everything through one event type, and a vertex
+cascade encoded as `RequireCardinality(k)` would silently lose which edges
+survived -- the members of that axis would each be free to keep a different `k`.
+
+One process note. A test written *for* a failure mode is not automatically a
+test *of* it. The nested-instance test asserted that a replayed mask keeps `E`
+and `W` consistent, which a replayed mask does: it projects both wrongly, but
+equally. Only pinning which edge survived caught it, and until then the
+benchcases were the sole detector. Assert identity, not just consistency.

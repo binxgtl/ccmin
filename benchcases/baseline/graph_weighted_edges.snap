@@ -1,0 +1,12 @@
+# ccmin baseline snapshot for `graph_weighted_edges`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 17
+final_tokens = 8
+oracle_calls = 71
+predicate_holds = true
+[input]
+4 2
+1 2
+3 4
+10 40
