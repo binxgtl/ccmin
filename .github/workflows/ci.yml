@@ -28,3 +28,23 @@ jobs:
         run: |
           cargo run --release -- --demo --no-save && code=0 || code=$?
           test "$code" -eq 1
+      - name: tree reducer end-to-end
+        shell: bash
+        run: |
+          cargo run --release -- \
+            --shape tree \
+            --sol testdata/tree/sol.cpp \
+            --brute testdata/tree/brute.cpp \
+            --gen testdata/tree/gen.cpp \
+            --iters 1 --no-save --no-color && code=0 || code=$?
+          test "$code" -eq 1
+      - name: graph reducer end-to-end
+        shell: bash
+        run: |
+          cargo run --release -- \
+            --shape graph \
+            --sol testdata/graph/sol.cpp \
+            --brute testdata/graph/brute.cpp \
+            --gen testdata/graph/gen.cpp \
+            --iters 1 --no-save --no-color && code=0 || code=$?
+          test "$code" -eq 1

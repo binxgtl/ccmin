@@ -7,7 +7,7 @@
 //! Every candidate is rendered from the model, so the declared length prefix
 //! always matches the data. See `model.rs` for why that matters.
 
-use crate::model::{ArrayCase, Model};
+use crate::model::{ArrayCase, GraphCase, Model};
 use crate::oracle::{FailKind, Oracle};
 
 pub struct Shrinker<'a> {
@@ -72,6 +72,8 @@ impl<'a> Shrinker<'a> {
                 }
                 Model::MultiTest(out)
             }
+            Model::Tree(tree) => Model::Tree(self.shrink_tree(tree)),
+            Model::Graph(graph) => Model::Graph(self.shrink_graph(graph)),
             Model::Raw(lines) => {
                 // Drop whole lines first, then thin out the tokens on each
                 // surviving line. Without the second step a single-line input
@@ -119,6 +121,54 @@ impl<'a> Shrinker<'a> {
         })
     }
 
+    fn shrink_tree(&mut self, tree: &GraphCase) -> GraphCase {
+        let mut current = tree.clone();
+        loop {
+            let leaves = current.leaves();
+            if leaves.len() < 2 {
+                break;
+            }
+            let mut is_leaf = vec![false; current.n + 1];
+            for leaf in &leaves {
+                is_leaf[*leaf] = true;
+            }
+            let internal: Vec<usize> = (1..=current.n).filter(|vertex| !is_leaf[*vertex]).collect();
+            let base = current.clone();
+            let kept_leaves = ddmin(&leaves, |candidate_leaves| {
+                let mut kept = internal.clone();
+                kept.extend_from_slice(candidate_leaves);
+                kept.sort_unstable();
+                if kept.is_empty() {
+                    return false;
+                }
+                self.accept(&Model::Tree(base.induced(&kept)))
+            });
+            if kept_leaves.len() == leaves.len() {
+                break;
+            }
+            let mut kept = internal;
+            kept.extend(kept_leaves);
+            kept.sort_unstable();
+            current = base.induced(&kept);
+        }
+        current
+    }
+
+    fn shrink_graph(&mut self, graph: &GraphCase) -> GraphCase {
+        let base = graph.clone();
+        let edges = ddmin_allow_empty(&base.edges, |candidate| {
+            self.accept(&Model::Graph(base.with_edges(candidate.to_vec())))
+        });
+        let current = base.with_edges(edges);
+
+        let vertices: Vec<usize> = (1..=current.n).collect();
+        let base = current.clone();
+        let kept = ddmin(&vertices, |candidate| {
+            !candidate.is_empty() && self.accept(&Model::Graph(base.induced(candidate)))
+        });
+        base.induced(&kept)
+    }
+
     // ---- values ----------------------------------------------------------
 
     fn values(&mut self, m: &Model) -> Model {
@@ -162,6 +212,7 @@ impl<'a> Shrinker<'a> {
                 }
                 Model::MultiTest(out)
             }
+            Model::Tree(_) | Model::Graph(_) => m.clone(),
             // Raw values are not necessarily numeric; leave them alone.
             Model::Raw(_) => m.clone(),
         }
@@ -201,6 +252,15 @@ fn ddmin<T: Clone>(items: &[T], mut accept: impl FnMut(&[T]) -> bool) -> Vec<T> 
         }
     }
     cur
+}
+
+fn ddmin_allow_empty<T: Clone>(items: &[T], mut accept: impl FnMut(&[T]) -> bool) -> Vec<T> {
+    let current = ddmin(items, &mut accept);
+    if !current.is_empty() && accept(&[]) {
+        Vec::new()
+    } else {
+        current
+    }
 }
 
 fn shrink_ints(vals: &[i64], mut accept: impl FnMut(&[i64]) -> bool) -> Vec<i64> {
@@ -279,5 +339,11 @@ mod tests {
         // Failure condition: some element is negative.
         let out = shrink_ints(&[500, -900_000, 12], |c| c.iter().any(|v| *v < 0));
         assert_eq!(out, vec![0, -1, 0]);
+    }
+
+    #[test]
+    fn graph_ddmin_can_remove_the_final_edge() {
+        let out = ddmin_allow_empty(&[42], |_| true);
+        assert!(out.is_empty());
     }
 }

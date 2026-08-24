@@ -178,7 +178,7 @@ fn run() -> Result<bool, String> {
     );
     println!(
         "      initial counterexample: {}, shape: {}",
-        term::bold(&plural(parsed.size(), "value")),
+        term::bold(&plural(parsed.size(), parsed.size_unit())),
         parsed.shape_name()
     );
 
@@ -238,7 +238,7 @@ fn run() -> Result<bool, String> {
                 chain.push(s);
             }
             if term::interactive() {
-                print!("\r      {}", plural(s, "value"));
+                print!("\r      {}", plural(s, m.size_unit()));
                 let _ = std::io::stdout().flush();
             }
         };
@@ -459,10 +459,12 @@ fn parse_args() -> Result<Args, String> {
                     "auto" => Shape::Auto,
                     "array" => Shape::Array,
                     "multitest" | "multi-test" => Shape::MultiTest,
+                    "tree" => Shape::Tree,
+                    "graph" => Shape::Graph,
                     "raw" => Shape::Raw,
                     _ => {
                         return Err(format!(
-                            "unknown shape `{value}` (expected auto, array, multitest, or raw)"
+                            "unknown shape `{value}` (expected auto, array, multitest, tree, graph, or raw)"
                         ))
                     }
                 };
@@ -518,7 +520,8 @@ OPTIONS:
     -n, --iters <N>        stress cases to try     [default: 200]
     -t, --timeout <MS>     per-run timeout         [default: 3000]
     -o, --out <FILE>       where to save the case  [default: minimal.in]
-        --shape <SHAPE>    auto, array, multitest, or raw [default: auto]
+        --shape <SHAPE>    auto, array, multitest, tree, graph, or raw
+                          [default: auto]
         --n-index <INDEX>  length field in an array header (zero-based)
         --strict           disable heuristic extended-header detection
         --no-save          do not write the reduced input to disk

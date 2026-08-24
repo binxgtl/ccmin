@@ -85,7 +85,7 @@ ccmin -s solution.cpp -b slow.cpp -g generator.cpp -n 1000
 -t, --timeout <MS>     per-run timeout         [default: 3000]
 -o, --out <FILE>       where to save the case  [default: minimal.in]
     --no-save          do not write minimal.in
-    --shape <SHAPE>    auto, array, multitest, or raw
+    --shape <SHAPE>    auto, array, multitest, tree, graph, or raw
     --n-index <INDEX>  length field in an array header (zero-based)
     --strict           disable heuristic extended-header detection
     --demo             run the built-in example
@@ -114,6 +114,8 @@ shapes:
 
 - `N` followed by `N` integers, optionally with extra header scalars (`N K`)
 - `T` followed by `T` independent `N` + `N integers` cases
+- unweighted tree: `N` followed by `N - 1` one-based edges
+- unweighted graph: `N M` followed by `M` one-based edges
 
 Auto-detection is convenient but cannot prove a problem's schema. In
 particular, extended headers are inferred when one of their first three values
@@ -124,9 +126,17 @@ heuristic match. Override it when you know the format:
 ccmin --shape array                 # confirm an array model
 ccmin --shape array --n-index 1     # e.g. K N, with N at index 1
 ccmin --shape multitest             # T blocks of N + N integers
+ccmin --shape tree                  # N, then N-1 edges
+ccmin --shape graph                 # N M, then M edges
 ccmin --shape raw                   # never update a length field
 ccmin --strict                      # auto-detect only simple N / T forms
 ```
+
+Tree and graph shapes are explicit-only: auto mode never selects these models,
+so pass the corresponding `--shape` flag. Tree shrinking prunes leaves,
+preserving connectivity and acyclicity. Graph
+shrinking deletes edges and induced vertex subsets, compacts labels back to
+`1..=N`, and re-renders both `N` and `M` after every accepted edit.
 
 Two further guards:
 
@@ -164,8 +174,9 @@ single batch so you pay that cost once rather than three times.
 Being specific about this, because a shrinker that quietly mangles your input
 is worse than no shrinker:
 
-- **Graphs, trees and geometry are not modelled.** They fall back to token-level
-  shrinking with a warning. Trees are the most-requested shape and are next.
+- **Weighted edges, per-vertex data and geometry are not modelled.** Use raw
+  mode for those formats; tree and graph shapes currently cover unweighted
+  one-based edge lists only.
 - **Constraints are not read.** If the problem says `1 <= a_i <= 10^9`, `ccmin`
   may shrink a value to `0`. Nothing parses the statement. A `--min-value` flag
   is the likely fix.

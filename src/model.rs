@@ -46,12 +46,85 @@ impl ArrayCase {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Edge {
+    pub u: usize,
+    pub v: usize,
+}
+
+/// A one-based, unweighted graph. `Tree` uses the same representation with the
+/// additional invariant that the graph is connected and has `n - 1` edges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphCase {
+    pub n: usize,
+    pub edges: Vec<Edge>,
+}
+
+impl GraphCase {
+    fn render_tree_into(&self, out: &mut String) {
+        out.push_str(&self.n.to_string());
+        out.push('\n');
+        self.render_edges_into(out);
+    }
+
+    fn render_graph_into(&self, out: &mut String) {
+        out.push_str(&format!("{} {}\n", self.n, self.edges.len()));
+        self.render_edges_into(out);
+    }
+
+    fn render_edges_into(&self, out: &mut String) {
+        for edge in &self.edges {
+            out.push_str(&format!("{} {}\n", edge.u, edge.v));
+        }
+    }
+
+    pub fn with_edges(&self, edges: Vec<Edge>) -> Self {
+        Self { n: self.n, edges }
+    }
+
+    /// Keep an induced subgraph and compact its vertex labels back to 1..=N.
+    pub fn induced(&self, kept: &[usize]) -> Self {
+        let mut remap = vec![0usize; self.n + 1];
+        for (new, old) in kept.iter().copied().enumerate() {
+            if old <= self.n {
+                remap[old] = new + 1;
+            }
+        }
+        let edges = self
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let u = remap[edge.u];
+                let v = remap[edge.v];
+                (u != 0 && v != 0).then_some(Edge { u, v })
+            })
+            .collect();
+        Self {
+            n: kept.len(),
+            edges,
+        }
+    }
+
+    pub fn leaves(&self) -> Vec<usize> {
+        let mut degree = vec![0usize; self.n + 1];
+        for edge in &self.edges {
+            degree[edge.u] += 1;
+            degree[edge.v] += 1;
+        }
+        (1..=self.n).filter(|v| degree[*v] <= 1).collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Model {
     /// `N` followed by `N` integers, optionally with extra scalars in the header.
     Array(ArrayCase),
     /// `T` followed by `T` independent array cases.
     MultiTest(Vec<ArrayCase>),
+    /// `N` followed by exactly `N - 1` unweighted edges.
+    Tree(GraphCase),
+    /// `N M` followed by exactly `M` unweighted edges.
+    Graph(GraphCase),
     /// Unrecognised shape. Shrunk at the token level, validity not guaranteed.
     Raw(Vec<Vec<String>>),
 }
@@ -62,6 +135,8 @@ pub enum Shape {
     Auto,
     Array,
     MultiTest,
+    Tree,
+    Graph,
     Raw,
 }
 
@@ -86,6 +161,8 @@ impl Model {
                     t.render_into(&mut out);
                 }
             }
+            Model::Tree(tree) => tree.render_tree_into(&mut out),
+            Model::Graph(graph) => graph.render_graph_into(&mut out),
             Model::Raw(lines) => {
                 for l in lines {
                     out.push_str(&l.join(" "));
@@ -101,7 +178,16 @@ impl Model {
         match self {
             Model::Array(c) => c.arr.len(),
             Model::MultiTest(tests) => tests.iter().map(|t| t.arr.len()).sum::<usize>(),
+            Model::Tree(tree) | Model::Graph(tree) => tree.n + tree.edges.len(),
             Model::Raw(lines) => lines.iter().map(|l| l.len()).sum(),
+        }
+    }
+
+    pub fn size_unit(&self) -> &'static str {
+        match self {
+            Model::Array(_) | Model::MultiTest(_) => "value",
+            Model::Tree(_) | Model::Graph(_) => "graph item",
+            Model::Raw(_) => "token",
         }
     }
 
@@ -109,6 +195,8 @@ impl Model {
         match self {
             Model::Array(_) => "array",
             Model::MultiTest(_) => "multi-test",
+            Model::Tree(_) => "tree",
+            Model::Graph(_) => "graph",
             Model::Raw(_) => "raw tokens",
         }
     }
@@ -130,6 +218,7 @@ impl Model {
         match self {
             Model::Array(c) => acc(&c.arr),
             Model::MultiTest(tests) => tests.iter().for_each(|t| acc(&t.arr)),
+            Model::Tree(_) | Model::Graph(_) => {}
             Model::Raw(lines) => {
                 for l in lines {
                     for tok in l {
@@ -199,6 +288,24 @@ pub fn parse_with(text: &str, options: ParseOptions) -> Result<Model, String> {
                     .into()
             });
         }
+        Shape::Tree => {
+            if options.n_index.is_some() {
+                return Err("--n-index is supported only with --shape array".into());
+            }
+            return try_tree(&ints).map(Model::Tree).ok_or_else(|| {
+                "input does not match --shape tree (expected N, then N-1 valid one-based edges forming a tree)"
+                    .into()
+            });
+        }
+        Shape::Graph => {
+            if options.n_index.is_some() {
+                return Err("--n-index is supported only with --shape array".into());
+            }
+            return try_graph(&ints).map(Model::Graph).ok_or_else(|| {
+                "input does not match --shape graph (expected N M, then M valid one-based edges)"
+                    .into()
+            });
+        }
         Shape::Auto => {}
     }
 
@@ -230,6 +337,8 @@ fn shape_label(shape: Shape) -> &'static str {
         Shape::Auto => "auto",
         Shape::Array => "array",
         Shape::MultiTest => "multitest",
+        Shape::Tree => "tree",
+        Shape::Graph => "graph",
         Shape::Raw => "raw",
     }
 }
@@ -296,6 +405,76 @@ fn try_multitest(ints: &[i64]) -> Option<Vec<ArrayCase>> {
     } else {
         None
     }
+}
+
+fn try_tree(ints: &[i64]) -> Option<GraphCase> {
+    let n = positive_usize(*ints.first()?)?;
+    let edge_count = n.checked_sub(1)?;
+    let data_len = edge_count.checked_mul(2)?;
+    if ints.len() != 1usize.checked_add(data_len)? {
+        return None;
+    }
+    let graph = GraphCase {
+        n,
+        edges: parse_edges(&ints[1..], n)?,
+    };
+    is_tree(&graph).then_some(graph)
+}
+
+fn try_graph(ints: &[i64]) -> Option<GraphCase> {
+    let n = positive_usize(*ints.first()?)?;
+    let m = usize::try_from(*ints.get(1)?).ok()?;
+    let data_len = m.checked_mul(2)?;
+    if ints.len() != 2usize.checked_add(data_len)? {
+        return None;
+    }
+    Some(GraphCase {
+        n,
+        edges: parse_edges(&ints[2..], n)?,
+    })
+}
+
+fn positive_usize(value: i64) -> Option<usize> {
+    let value = usize::try_from(value).ok()?;
+    (value > 0).then_some(value)
+}
+
+fn parse_edges(ints: &[i64], n: usize) -> Option<Vec<Edge>> {
+    let mut edges = Vec::with_capacity(ints.len() / 2);
+    let mut chunks = ints.chunks_exact(2);
+    for pair in &mut chunks {
+        let u = positive_usize(pair[0])?;
+        let v = positive_usize(pair[1])?;
+        if u > n || v > n {
+            return None;
+        }
+        edges.push(Edge { u, v });
+    }
+    chunks.remainder().is_empty().then_some(edges)
+}
+
+fn is_tree(graph: &GraphCase) -> bool {
+    if graph.n == 0 || graph.edges.len() != graph.n - 1 {
+        return false;
+    }
+    let mut parent: Vec<usize> = (0..=graph.n).collect();
+    for edge in &graph.edges {
+        let u = find_root(&mut parent, edge.u);
+        let v = find_root(&mut parent, edge.v);
+        if u == v {
+            return false;
+        }
+        parent[u] = v;
+    }
+    true
+}
+
+fn find_root(parent: &mut [usize], mut v: usize) -> usize {
+    while parent[v] != v {
+        parent[v] = parent[parent[v]];
+        v = parent[v];
+    }
+    v
 }
 
 #[cfg(test)]
@@ -411,6 +590,82 @@ mod tests {
             "4\n1 2 3\n",
             ParseOptions {
                 shape: Shape::Array,
+                ..ParseOptions::default()
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_and_renders_explicit_tree() {
+        let parsed = parse_with(
+            "4\n1 2\n2 3\n2 4\n",
+            ParseOptions {
+                shape: Shape::Tree,
+                ..ParseOptions::default()
+            },
+        )
+        .unwrap();
+        let Model::Tree(tree) = parsed else { panic!() };
+        assert_eq!(tree.n, 4);
+        assert_eq!(tree.edges.len(), 3);
+        assert_eq!(Model::Tree(tree).render(), "4\n1 2\n2 3\n2 4\n");
+    }
+
+    #[test]
+    fn tree_parser_rejects_cycles_and_disconnected_vertices() {
+        let result = parse_with(
+            "4\n1 2\n2 3\n3 1\n",
+            ParseOptions {
+                shape: Shape::Tree,
+                ..ParseOptions::default()
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_graph_and_resyncs_m_after_edge_deletion() {
+        let parsed = parse_with(
+            "4 3\n1 2\n2 3\n4 4\n",
+            ParseOptions {
+                shape: Shape::Graph,
+                ..ParseOptions::default()
+            },
+        )
+        .unwrap();
+        let Model::Graph(graph) = parsed else {
+            panic!()
+        };
+        let smaller = graph.with_edges(vec![graph.edges[0]]);
+        assert_eq!(Model::Graph(smaller).render(), "4 1\n1 2\n");
+    }
+
+    #[test]
+    fn induced_subgraph_compacts_vertex_labels() {
+        let graph = GraphCase {
+            n: 5,
+            edges: vec![
+                Edge { u: 1, v: 3 },
+                Edge { u: 3, v: 5 },
+                Edge { u: 2, v: 4 },
+            ],
+        };
+        assert_eq!(
+            graph.induced(&[1, 3, 5]),
+            GraphCase {
+                n: 3,
+                edges: vec![Edge { u: 1, v: 2 }, Edge { u: 2, v: 3 }],
+            }
+        );
+    }
+
+    #[test]
+    fn graph_parser_rejects_out_of_range_endpoint() {
+        let result = parse_with(
+            "3 1\n1 4\n",
+            ParseOptions {
+                shape: Shape::Graph,
                 ..ParseOptions::default()
             },
         );
