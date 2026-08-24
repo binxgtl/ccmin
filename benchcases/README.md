@@ -81,6 +81,9 @@ fails if one is dropped.
 | `graph_weighted_edges` | a vertex selection inducing an edge selection |
 | `graph_two_inducers_one_target` | two induced masks intersecting |
 | `graph_cascade_nested_instances` | one cascade per repeat instance |
+| `index_cascade` | references dropped and renumbered |
+| `graph_and_index_same_target` | two producers, one target |
+| `index_nested_instances` | one index relation per repeat instance |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with

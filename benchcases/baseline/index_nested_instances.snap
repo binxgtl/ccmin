@@ -1,0 +1,17 @@
+# ccmin baseline snapshot for `index_nested_instances`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 15
+final_tokens = 7
+oracle_calls = 42
+predicate_holds = true
+[input]
+2
+1
+30
+0
+
+1
+40
+0
+

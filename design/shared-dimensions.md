@@ -271,9 +271,15 @@ be free to keep a different two.
 
 A cardinality requirement is the weaker thing, and is what a count needs when
 two of its axes must end the same size without either determining the other's
-positions. It has no producer yet, which is why it is not implemented: the only
-cascade that exists is positional. It arrives with the first relation whose
-semantics really are "this many" rather than "these ones".
+positions.
+
+It still has no producer. Both cascades that exist are positional: a vertex
+selection says *which* edges survive, and an index selection says *which*
+references survive. Reassessed after `Index` landed, since that was the obvious
+candidate for a size-only rule, and it is not one -- an index knows exactly
+which of its entries point at something that vanished. Until a relation turns
+up whose information really is "this many" rather than "these ones",
+`RequireCardinality` would be a type with no inhabitants.
 
 For a bijection the edge is bidirectional (§9). The engine contract:
 
@@ -683,8 +689,10 @@ property of an array; it is which axis the array points at (§6).
 4. Minimal occurrence-local worklist around induced          done
    selections. One event, intersection-only merge, fixed
    point before projection.
-5. Index elements, generalising what graph endpoints are.
+5. Index elements, generalising graph endpoints.             done
+   Producer #2 on the existing worklist; no redesign.
 6. RequireCardinality, once a relation induces only a size.
+   Still no producer: both cascades are positional.
 7. Generalise validate / induce once two relation forms
    exist to prove the abstraction.
 ```

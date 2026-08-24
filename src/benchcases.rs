@@ -376,6 +376,75 @@ repeat T {
         Pred::ContainsAll(&[30, 61]),
     );
 
+    // --- index references -------------------------------------------------
+    // Selecting the target drops references to what vanished and renumbers
+    // the rest.
+    add(
+        "index_cascade",
+        Some(
+            "int N in 1..10
+array A[N] in 0..999
+int K in 0..10
+             index I[K] into N
+",
+        ),
+        Shape::Auto,
+        "4
+10 20 30 40
+3
+2 4 1
+"
+        .into(),
+        Pred::ContainsAll(&[40]),
+    );
+    // A graph cascade and an index cascade aiming at one occurrence.
+    add(
+        "graph_and_index_same_target",
+        Some(
+            "int N in 1..10
+int M in 0..20
+graph E[M] vertices N
+             index I[M] into N
+",
+        ),
+        Shape::Auto,
+        "4 3
+1 2
+2 3
+3 4
+4 3 1
+"
+        .into(),
+        Pred::MinTokens(5),
+    );
+    // The same static index relation once per repeat instance.
+    add(
+        "index_nested_instances",
+        Some(
+            "int T in 1..3
+repeat T {
+  int N in 1..10
+  array A[N] in 0..999
+               int K in 0..10
+  index I[K] into N
+}
+",
+        ),
+        Shape::Auto,
+        "2
+3
+10 20 30
+2
+1 3
+3
+40 50 60
+2
+2 3
+"
+        .into(),
+        Pred::ContainsAll(&[30, 40]),
+    );
+
     // --- the unstructured fallback --------------------------------------
     add(
         "raw_tokens",
@@ -620,6 +689,9 @@ fn corpus_covers_every_reduction_path() {
         "graph_weighted_edges",
         "graph_two_inducers_one_target",
         "graph_cascade_nested_instances",
+        "index_cascade",
+        "graph_and_index_same_target",
+        "index_nested_instances",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

@@ -114,6 +114,15 @@ pub enum Decl {
         edges: Ref,
         verts: Ref,
     },
+    /// `len` values, each naming a one-based position on the axis that sizes
+    /// `target`. A reference, not a magnitude: `index` says so explicitly
+    /// rather than being inferred from an `in 1..N` bound, because
+    /// `int K in 1..N` ("choose K of them") means something else entirely.
+    Index {
+        name: String,
+        len: Ref,
+        target: Ref,
+    },
     Repeat {
         count: Ref,
         body: Vec<Decl>,
@@ -127,7 +136,8 @@ impl Decl {
             | Decl::Array { name, .. }
             | Decl::Matrix { name, .. }
             | Decl::Tree { name, .. }
-            | Decl::Graph { name, .. } => Some(name),
+            | Decl::Graph { name, .. }
+            | Decl::Index { name, .. } => Some(name),
             Decl::Repeat { .. } => None,
         }
     }
@@ -257,6 +267,29 @@ impl Schema {
     }
 }
 
+fn check_index_targets(
+    items: &[Decl],
+    count_by_name: &HashMap<String, CountId>,
+) -> Result<(), String> {
+    for decl in items {
+        match decl {
+            Decl::Index {
+                name,
+                target: Ref::Name(n),
+                ..
+            } if !count_by_name.contains_key(n) => {
+                return Err(format!(
+                    "`{name}` indexes into `{n}`, but nothing is sized by `{n}`, so there is \
+                     no axis to reference"
+                ));
+            }
+            Decl::Repeat { body, .. } => check_index_targets(body, count_by_name)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Allocate one count per derived `int`, and one axis per count, in
 /// declaration order so the identifiers are stable.
 fn build_arenas(
@@ -316,6 +349,9 @@ pub fn parse_schema(text: &str) -> Result<Rc<Schema>, String> {
     let mut axes = Vec::new();
     let mut count_by_name = HashMap::new();
     build_arenas(&items, &derived, &mut counts, &mut axes, &mut count_by_name);
+    // An index can only reference an axis that exists, and an axis exists only
+    // where something is sized by that count.
+    check_index_targets(&items, &count_by_name)?;
 
     Ok(Rc::new(Schema {
         items,
@@ -449,6 +485,26 @@ fn parse_decl(
                 verts,
             })
         }
+        "index" => {
+            let (name, dims, rest) = parse_name_dims(no, &tokens[1..])?;
+            if dims.len() != 1 {
+                return Err(at(
+                    "`index` needs a length, as in `index I[K] into N`".into()
+                ));
+            }
+            if rest.len() != 2 || rest[0] != "into" {
+                return Err(at("expected `into <count>` (for example `into N`)".into()));
+            }
+            let target = value_ref(no, &rest[1])?;
+            if matches!(target, Ref::Lit(_)) {
+                return Err(at("`into` needs the name of a count".into()));
+            }
+            Ok(Decl::Index {
+                name,
+                len: dims[0].clone(),
+                target,
+            })
+        }
         "repeat" => {
             if tokens.len() != 3 || tokens[2] != "{" {
                 return Err(at("expected `repeat <count> {`".into()));
@@ -461,7 +517,8 @@ fn parse_decl(
             Ok(Decl::Repeat { count, body })
         }
         other => Err(at(format!(
-            "unknown declaration `{other}` (expected int, array, matrix, tree, graph or repeat)"
+            "unknown declaration `{other}` (expected int, array, matrix, tree, graph, index \
+             or repeat)"
         ))),
     }
 }
@@ -629,6 +686,7 @@ fn validate(
                 // sharing it is fine.
                 use_count(verts, "vertex count", name, false)?;
             }
+            Decl::Index { name, len, .. } => use_count(len, "length", name, false)?,
             Decl::Repeat { count, body } => {
                 use_count(count, "repeat count", "repeat", false)?;
                 validate(body, uses, all_names)?;
@@ -821,6 +879,20 @@ fn read_decl(
             let m = resolve(schema, edges, current, name)?;
             let list = read_edges(cursor, m, n, name)?;
             Ok(Value::Graph(GraphCase { n, edges: list }))
+        }
+        Decl::Index { name, len, target } => {
+            let n = resolve(schema, len, current, name)?;
+            let extent = resolve(schema, target, current, name)?;
+            let mut refs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let v = cursor.take(name)?;
+                let ok = v >= 1 && usize::try_from(v).map(|v| v <= extent).unwrap_or(false);
+                if !ok {
+                    return Err(format!("`{name}`: reference {v} is outside 1..={extent}"));
+                }
+                refs.push(v);
+            }
+            Ok(Value::Array(refs))
         }
         Decl::Repeat { count, body } => {
             let k = resolve(schema, count, current, "repeat")?;
@@ -1025,6 +1097,7 @@ fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
                 sizes.push((edges, g.edges.len()));
                 sizes.push((verts, g.n));
             }
+            (Decl::Index { len, .. }, Value::Array(refs)) => sizes.push((len, refs.len())),
             (Decl::Repeat { count, .. }, Value::Repeat(iters)) => sizes.push((count, iters.len())),
             _ => {}
         }
@@ -1294,8 +1367,21 @@ fn sizing_roles(decl: &Decl) -> Vec<(&Ref, Role)> {
         Decl::Graph { edges, verts, .. } => {
             vec![(edges, Role::Edges), (verts, Role::GraphVertices)]
         }
+        // Only the length. `target` is a reference, not a size.
+        Decl::Index { len, .. } => vec![(len, Role::Elements)],
         Decl::Repeat { count, .. } => vec![(count, Role::Iterations)],
     }
+}
+
+/// The declarations of the block a `Path` prefix names.
+fn block_at<'a>(items: &'a [Decl], prefix: &[usize]) -> Option<&'a [Decl]> {
+    if prefix.is_empty() {
+        return Some(items);
+    }
+    let Decl::Repeat { body, .. } = items.get(*prefix.first()?)? else {
+        return None;
+    };
+    block_at(body, &prefix[2..])
 }
 
 /// How many positions this member currently has along `role`.
@@ -1488,9 +1574,114 @@ fn propagate(
                 queue.push_back(target);
             }
         }
+
+        // Producer #2. An `index` whose target axis just narrowed loses every
+        // reference to a position that no longer survives. Same event, same
+        // merge, same queue -- a second producer, not a second mechanism.
+        let Some(block) = block_at(&schema.items, &key.0) else {
+            continue;
+        };
+        for (i, decl) in block.iter().enumerate() {
+            let Decl::Index { len, target, .. } = decl else {
+                continue;
+            };
+            if schema.sizing_axis(target) != Some(key.1) {
+                continue;
+            }
+            let Some(index_axis) = schema.sizing_axis(len) else {
+                continue;
+            };
+            let mut path = key.0.clone();
+            path.push(i);
+            // ORIGINAL references plus the current source mask. Never a
+            // projection: the values are positions in the target's original
+            // domain, and projected data no longer carries that identity.
+            let Some(Value::Array(refs)) = value_at(&data.values, &path) else {
+                continue;
+            };
+            let survivors: Vec<usize> = refs
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| match usize::try_from(**v - 1) {
+                    Ok(position) => source.binary_search(&position).is_ok(),
+                    Err(_) => false,
+                })
+                .map(|(position, _)| position)
+                .collect();
+
+            let target_key: OccurrenceKey = (key.0.clone(), index_axis);
+            let Some(target_occ) = all
+                .iter()
+                .find(|o| o.prefix == key.0 && o.axis == index_axis)
+            else {
+                continue;
+            };
+            let Some(extent) = occurrence_extent(data, target_occ) else {
+                continue;
+            };
+            let domain: Vec<usize> = (0..extent).collect();
+            if state.narrow(target_key.clone(), &survivors, &domain) {
+                queue.push_back(target_key);
+            }
+        }
     }
 
     state
+}
+
+/// Rewrite surviving references from original target positions to projected
+/// ones.
+///
+/// Derived from the final keep-mask, never maintained during propagation. A
+/// reference whose target did not survive means the induction missed it: the
+/// candidate is rejected rather than clipped, renumbered onto a neighbour, or
+/// left dangling.
+fn renumber_indices(
+    schema: &Schema,
+    items: &[Decl],
+    trial: &mut SchemaData,
+    prefix: &Path,
+    masks: &BTreeMap<OccurrenceKey, Vec<usize>>,
+) -> Option<()> {
+    for (i, decl) in items.iter().enumerate() {
+        let mut path = prefix.clone();
+        path.push(i);
+        match decl {
+            Decl::Index { target, .. } => {
+                let Some(axis) = schema.sizing_axis(target) else {
+                    continue;
+                };
+                let Some(mask) = masks.get(&(prefix.clone(), axis)) else {
+                    continue; // the target was untouched, so the labels hold
+                };
+                let Some(Value::Array(refs)) = value_at(&trial.values, &path).cloned() else {
+                    continue;
+                };
+                let mut rewritten = Vec::with_capacity(refs.len());
+                for reference in refs {
+                    let old = usize::try_from(reference - 1).ok()?;
+                    // Position within the survivors, one-based. `None` here is
+                    // a dangling reference: reject the candidate.
+                    let new = mask.binary_search(&old).ok()? + 1;
+                    rewritten.push(new as i64);
+                }
+                put(trial, &path, Value::Array(rewritten));
+            }
+            Decl::Repeat { body, .. } => {
+                let iterations = match value_at(&trial.values, &path) {
+                    Some(Value::Repeat(iters)) => iters.len(),
+                    _ => 0,
+                };
+                for k in 0..iterations {
+                    let mut inner = path.clone();
+                    inner.push(k);
+                    renumber_indices(schema, body, trial, &inner, masks)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(())
 }
 
 /// Keep `vertex_keep` vertices and `edge_keep` edge positions, relabelling the
@@ -1593,6 +1784,16 @@ fn project_fixpoint(
         let projected = apply_masks(original, &ops)?;
         put(&mut trial, &path, projected);
     }
+
+    // Only now, with the final masks known.
+    let schema = Rc::clone(&data.schema);
+    renumber_indices(
+        &schema,
+        &schema.items,
+        &mut trial,
+        &Vec::new(),
+        &state.masks,
+    )?;
     // Downstream bookkeeping only: resync observes members that are already
     // consistent, it does not take part in deciding which positions survived.
     trial.resync();
@@ -2362,6 +2563,7 @@ mod tests {
             Decl::Matrix { rows, cols, .. } => vec![rows, cols],
             Decl::Tree { verts, .. } => vec![verts],
             Decl::Graph { edges, verts, .. } => vec![edges, verts],
+            Decl::Index { len, .. } => vec![len],
             Decl::Repeat { count, .. } => vec![count],
         }
     }
@@ -2547,6 +2749,7 @@ repeat T {
         for (i, decl) in items.iter().enumerate() {
             match (decl, &values[i]) {
                 (Decl::Array { len, .. }, Value::Array(a)) => expect(len, a.len(), "its array"),
+                (Decl::Index { len, .. }, Value::Array(r)) => expect(len, r.len(), "its indices"),
                 (Decl::Repeat { count, body }, Value::Repeat(iters)) => {
                     expect(count, iters.len(), "its block");
                     for (k, iter) in iters.iter().enumerate() {
@@ -2755,6 +2958,196 @@ repeat T {
             parse_input(&projected.schema, &projected.render()).unwrap(),
             projected
         );
+    }
+
+    /// The top-level occurrence of a named count, plus every occurrence.
+    fn occurrence_for(data: &SchemaData, count: &str) -> (Occurrence, Vec<Occurrence>) {
+        let axis = data
+            .schema
+            .sizing_axis(&Ref::Name(count.to_string()))
+            .unwrap_or_else(|| panic!("no axis for {count}"));
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let occ = all
+            .iter()
+            .find(|o| o.axis == axis && o.prefix.is_empty())
+            .expect("a top-level occurrence")
+            .clone();
+        (occ, all)
+    }
+
+    /// Dropping a reference and renumbering one are different things, and both
+    /// have to happen.
+    ///
+    /// Keeping positions 1 and 3 of `A`: the reference to old label 1 is
+    /// *dropped*, because what it named is gone. The references to old labels 2
+    /// and 4 are *renumbered* to 1 and 2, because what they name survived and
+    /// moved. Neither is clipped, and nothing is repointed at a neighbour.
+    #[test]
+    fn an_index_drops_dead_references_and_renumbers_live_ones() {
+        let text = "int N in 1..10\narray A[N] in 0..999\nint K in 0..10\n\
+                    index I[K] into N\n";
+        let data = build(text, "4\n10 20 30 40\n3\n2 4 1\n");
+
+        let (occ, all) = occurrence_for(&data, "N");
+        let projected = project_occurrence(&data, &occ, &[1, 3], &all).expect("projects");
+
+        // N, A, K, I. Old label 2 -> 1 and old label 4 -> 2; old label 1 gone.
+        assert_eq!(ints(&projected.render()), vec![2, 20, 40, 2, 1, 2]);
+        assert_eq!(
+            parse_input(&projected.schema, &projected.render()).unwrap(),
+            projected
+        );
+    }
+
+    /// Two `index` declarations sharing a length count both induce on that one
+    /// occurrence, and the fixed point is their intersection -- the same merge
+    /// the graph cascades go through.
+    #[test]
+    fn two_index_relations_on_one_target_intersect() {
+        let text = "int N in 1..10\narray A[N] in 0..999\nint K in 0..10\n\
+                    index I1[K] into N\nindex I2[K] into N\n";
+        let data = build(text, "3\n10 20 30\n3\n1 2 3\n3 2 1\n");
+
+        let (occ, all) = occurrence_for(&data, "N");
+        // Keeping labels 1 and 2: I1 loses position 2, I2 loses position 0.
+        let state = propagate(&data, &occ, &[0, 1], &all);
+        let k_axis = data
+            .schema
+            .sizing_axis(&Ref::Name("K".into()))
+            .expect("K has an axis");
+        assert_eq!(
+            state.masks.get(&(Vec::new(), k_axis)),
+            Some(&vec![1usize]),
+            "the fixed point is the intersection, not either mask alone"
+        );
+
+        let projected = project_fixpoint(&data, &state, &all).expect("projects");
+        assert_eq!(ints(&projected.render()), vec![2, 10, 20, 1, 2, 2]);
+    }
+
+    /// A graph cascade and an index cascade aiming at the same occurrence. Two
+    /// producers, one target, one merge.
+    #[test]
+    fn graph_and_index_cascades_converge_on_one_occurrence() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                    index I[M] into N\n";
+        let data = build(text, "4 3\n1 2\n2 3\n3 4\n4 3 1\n");
+
+        let (occ, all) = occurrence_for(&data, "N");
+        // Keeping vertices 1, 2, 3: the graph keeps edges {0,1}, the index
+        // keeps positions {1,2}. Their intersection is {1}.
+        let state = propagate(&data, &occ, &[0, 1, 2], &all);
+        let m_axis = data
+            .schema
+            .sizing_axis(&Ref::Name("M".into()))
+            .expect("M has an axis");
+        assert_eq!(state.masks.get(&(Vec::new(), m_axis)), Some(&vec![1usize]));
+
+        let projected = project_fixpoint(&data, &state, &all).expect("projects");
+        // N M, the surviving edge, then the surviving reference renumbered.
+        assert_eq!(ints(&projected.render()), vec![3, 1, 2, 3, 3]);
+        assert_eq!(
+            parse_input(&projected.schema, &projected.render()).unwrap(),
+            projected
+        );
+    }
+
+    /// A surviving reference whose target did not survive is a bug in the
+    /// induction. Projection rejects the candidate rather than clipping it,
+    /// renumbering it onto a neighbour, or emitting a dangling reference.
+    #[test]
+    fn a_dangling_reference_rejects_the_candidate() {
+        let text = "int N in 1..10\narray A[N] in 0..999\nint K in 0..10\n\
+                    index I[K] into N\n";
+        let data = build(text, "3\n10 20 30\n2\n1 3\n");
+
+        let (_, all) = occurrence_for(&data, "N");
+        let n_axis = data.schema.sizing_axis(&Ref::Name("N".into())).unwrap();
+        let k_axis = data.schema.sizing_axis(&Ref::Name("K".into())).unwrap();
+
+        // Hand-built and deliberately inconsistent: only label 1 of N survives,
+        // yet both references are kept -- and I[1] points at label 3.
+        let mut state = Propagation {
+            masks: BTreeMap::new(),
+            updates: 0,
+        };
+        state.masks.insert((Vec::new(), n_axis), vec![0]);
+        state.masks.insert((Vec::new(), k_axis), vec![0, 1]);
+
+        assert!(
+            project_fixpoint(&data, &state, &all).is_none(),
+            "a dangling reference must reject, not clip"
+        );
+    }
+
+    /// Two instances of one `index` declaration induce independently.
+    #[test]
+    fn index_induction_stays_inside_its_own_repeat_instance() {
+        let text = "int T in 1..3\nrepeat T {\n  int N in 1..10\n  \
+                    array A[N] in 0..999\n  int K in 0..10\n  index I[K] into N\n}\n";
+        let data = build(text, "2\n3\n10 20 30\n2\n1 3\n3\n40 50 60\n2\n2 3\n");
+
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let n_axis = data.schema.sizing_axis(&Ref::Name("N".into())).unwrap();
+        let instances: Vec<Occurrence> = all.iter().filter(|o| o.axis == n_axis).cloned().collect();
+        assert_eq!(instances.len(), 2, "one N occurrence per instance");
+
+        // Instance 0 keeps label 1: reference 1 lives, reference 3 dies.
+        let first = project_occurrence(&data, &instances[0], &[0], &all).expect("projects");
+        assert_eq!(
+            ints(&first.render()),
+            vec![2, 1, 10, 1, 1, 3, 40, 50, 60, 2, 2, 3],
+            "only instance 0 moved"
+        );
+
+        // Instance 1 keeps label 2: reference 2 lives and renumbers to 1.
+        let second = project_occurrence(&data, &instances[1], &[1], &all).expect("projects");
+        assert_eq!(
+            ints(&second.render()),
+            vec![2, 3, 10, 20, 30, 2, 1, 3, 1, 50, 1, 1],
+            "only instance 1 moved"
+        );
+    }
+
+    /// References are structure, not magnitude: the value pass must leave them
+    /// alone. Driving one toward zero would put it out of range.
+    #[test]
+    fn the_value_pass_does_not_shrink_references() {
+        let text = "int N in 1..10\narray A[N] in 0..999\nint K in 0..10\n\
+                    index I[K] into N\n";
+        let data = build(text, "3\n10 20 30\n2\n2 3\n");
+
+        // Accept everything, so the value pass takes whatever it can get.
+        let reduced = reduce(&data, |_| true);
+        let text_out = reduced.render();
+        assert_eq!(
+            parse_input(&reduced.schema, &text_out).unwrap(),
+            reduced,
+            "a shrunk reference would fall outside 1..=N and fail to re-parse"
+        );
+        let Value::Array(refs) = &reduced.values[3] else {
+            panic!("expected the index array")
+        };
+        let Value::Int(n) = &reduced.values[0] else {
+            panic!()
+        };
+        for r in refs {
+            assert!(*r >= 1 && r <= n, "reference {r} outside 1..={n}");
+        }
     }
 
     #[test]
