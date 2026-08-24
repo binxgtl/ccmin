@@ -139,15 +139,26 @@ impl Decl {
 // model separates three things v0.4 keeps as one: a Count owns cardinality, an
 // Axis owns positional identity, and a Reference names a position on an axis.
 //
-// This checkpoint introduces the identifiers and their storage only. Nothing
-// reads them to make a decision yet; the old `derived` set still drives every
-// behaviour, and a test asserts the two descriptions agree. Keeping both paths
-// alive means a benchcase that moves later can be blamed on one of them.
+// The arena is **static**: names, bounds, axis topology, and where each count's
+// value sits inside an instantiation of its block. It holds no cardinality and
+// no keep-mask, because a declaration inside a `repeat` body has one instance
+// per iteration and each has its own. Putting either on an arena node collapses
+// (declaration, instance) into (declaration) -- see revision 6 of the design
+// note, and `a_count_inside_a_repeat_differs_per_iteration`.
+//
+// Sizing lookups now resolve through the arena. The `derived` set survives only
+// so `value_pass` can ask whether a name is a count, and a test asserts the two
+// descriptions still agree.
 
 pub type CountId = usize;
 pub type AxisId = usize;
 
-/// An `int` that some declaration is sized by. Cardinality lives here.
+/// An `int` that some declaration is sized by.
+///
+/// Static. A count does **not** hold a cardinality: a declaration inside a
+/// `repeat` body is instantiated once per iteration and each instance has its
+/// own value. What the arena can hold is where to *find* that value, which is
+/// fixed by the schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Count {
     pub name: String,
@@ -155,6 +166,13 @@ pub struct Count {
     /// Every count has exactly one axis for now. Several axes per count is
     /// what makes shared dimensions possible, and is not this step.
     pub axis: AxisId,
+    /// Index of this count's `int` declaration within its own block.
+    ///
+    /// Values mirror declarations positionally, so in any instantiation of
+    /// that block `values[slot]` is this count's authoritative cardinality.
+    /// Validation requires a count to be declared in the block it sizes, so
+    /// the index is always meaningful where it is used.
+    pub slot: usize,
 }
 
 /// A set of positions with identity. Cardinality is *not* stored here; it
@@ -167,11 +185,10 @@ pub struct Axis {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
     pub items: Vec<Decl>,
-    /// Names bound to a count or vertex total. These are recomputed from the
-    /// data rather than shrunk on their own.
-    ///
-    /// Still authoritative. `counts` describes the same set and is checked
-    /// against it, but does not yet drive anything.
+    /// Names bound to a count or vertex total, so `value_pass` knows not to
+    /// shrink them directly. Sizing no longer goes through this set --
+    /// `counts` does that -- and a test asserts the two still describe the
+    /// same names.
     derived: HashSet<String>,
     counts: Vec<Count>,
     axes: Vec<Axis>,
@@ -182,19 +199,9 @@ impl Schema {
     pub fn is_derived(&self, name: &str) -> bool {
         self.derived.contains(name)
     }
-}
 
-// Read by the migration tests now, and by the reducer at the next checkpoint
-// when declarations start resolving through axes instead of names. The allow
-// is scoped to this block so it disappears with the scaffolding.
-#[allow(dead_code)]
-impl Schema {
     pub fn count_id(&self, name: &str) -> Option<CountId> {
         self.count_by_name.get(name).copied()
-    }
-
-    pub fn count(&self, id: CountId) -> &Count {
-        &self.counts[id]
     }
 
     pub fn count_ids(&self) -> std::ops::Range<CountId> {
@@ -207,8 +214,9 @@ impl Schema {
         self.counts[id].axis
     }
 
-    pub fn axis(&self, id: AxisId) -> &Axis {
-        &self.axes[id]
+    /// Where this count's value sits within an instantiation of its block.
+    pub fn count_slot(&self, id: CountId) -> usize {
+        self.counts[id].slot
     }
 
     /// The axis that sizes this reference, or `None` when the count is a
@@ -235,6 +243,18 @@ impl Schema {
     }
 }
 
+/// Read only by the migration tests, which check the arena's shape directly.
+#[cfg(test)]
+impl Schema {
+    pub fn count(&self, id: CountId) -> &Count {
+        &self.counts[id]
+    }
+
+    pub fn axis(&self, id: AxisId) -> &Axis {
+        &self.axes[id]
+    }
+}
+
 /// Allocate one count per derived `int`, and one axis per count, in
 /// declaration order so the identifiers are stable.
 fn build_arenas(
@@ -244,7 +264,7 @@ fn build_arenas(
     axes: &mut Vec<Axis>,
     by_name: &mut HashMap<String, CountId>,
 ) {
-    for decl in items {
+    for (slot, decl) in items.iter().enumerate() {
         match decl {
             Decl::Int { name, bounds } if derived.contains(name) => {
                 let count = counts.len();
@@ -253,6 +273,7 @@ fn build_arenas(
                     name: name.clone(),
                     bounds: *bounds,
                     axis,
+                    slot,
                 });
                 axes.push(Axis { count });
                 by_name.insert(name.clone(), count);
@@ -661,8 +682,12 @@ pub fn parse_input(schema: &Rc<Schema>, text: &str) -> Result<SchemaData, String
         tokens: &tokens,
         at: 0,
     };
-    let mut env: HashMap<String, i64> = HashMap::new();
-    let values = read_block(&schema.items, &mut cursor, &mut env)?;
+    // A register, not storage. Reading is linear, so by the time a length is
+    // needed the count for the current iteration has just been read into it.
+    // The authoritative value is the `Value::Int` slot; this only carries it
+    // forward a few tokens.
+    let mut current = vec![0i64; schema.count_ids().len()];
+    let values = read_block(schema, &schema.items, &mut cursor, &mut current)?;
 
     if cursor.at != tokens.len() {
         return Err(format!(
@@ -679,41 +704,50 @@ pub fn parse_input(schema: &Rc<Schema>, text: &str) -> Result<SchemaData, String
 }
 
 fn read_block(
+    schema: &Schema,
     items: &[Decl],
     cursor: &mut Cursor,
-    env: &mut HashMap<String, i64>,
+    current: &mut [i64],
 ) -> Result<Vec<Value>, String> {
     let mut out = Vec::with_capacity(items.len());
     for decl in items {
-        out.push(read_decl(decl, cursor, env)?);
+        out.push(read_decl(schema, decl, cursor, current)?);
     }
     Ok(out)
 }
 
-fn resolve(r: &Ref, env: &HashMap<String, i64>, owner: &str) -> Result<usize, String> {
+/// How long is the thing this reference sizes? A literal answers for itself; a
+/// name answers through its count, located by identifier rather than by string.
+fn resolve(schema: &Schema, r: &Ref, current: &[i64], owner: &str) -> Result<usize, String> {
     let v = match r {
         Ref::Lit(v) => *v,
-        Ref::Name(n) => *env
-            .get(n)
-            .ok_or_else(|| format!("`{owner}`: `{n}` has no value yet"))?,
+        Ref::Name(n) => {
+            let id = schema
+                .count_id(n)
+                .ok_or_else(|| format!("`{owner}`: `{n}` has no value yet"))?;
+            current[id]
+        }
     };
     usize::try_from(v).map_err(|_| format!("`{owner}`: count {v} is negative"))
 }
 
 fn read_decl(
+    schema: &Schema,
     decl: &Decl,
     cursor: &mut Cursor,
-    env: &mut HashMap<String, i64>,
+    current: &mut [i64],
 ) -> Result<Value, String> {
     match decl {
         Decl::Int { name, bounds } => {
             let v = cursor.take(name)?;
             check_bound(v, bounds, name)?;
-            env.insert(name.clone(), v);
+            if let Some(id) = schema.count_id(name) {
+                current[id] = v;
+            }
             Ok(Value::Int(v))
         }
         Decl::Array { name, len, bounds } => {
-            let n = resolve(len, env, name)?;
+            let n = resolve(schema, len, current, name)?;
             let mut arr = Vec::with_capacity(n);
             for _ in 0..n {
                 let v = cursor.take(name)?;
@@ -728,8 +762,8 @@ fn read_decl(
             cols,
             bounds,
         } => {
-            let r = resolve(rows, env, name)?;
-            let c = resolve(cols, env, name)?;
+            let r = resolve(schema, rows, current, name)?;
+            let c = resolve(schema, cols, current, name)?;
             let mut grid = Vec::with_capacity(r);
             for _ in 0..r {
                 let mut row = Vec::with_capacity(c);
@@ -743,7 +777,7 @@ fn read_decl(
             Ok(Value::Matrix(grid))
         }
         Decl::Tree { name, verts } => {
-            let n = resolve(verts, env, name)?;
+            let n = resolve(schema, verts, current, name)?;
             if n == 0 {
                 return Err(format!("`{name}`: a tree needs at least one vertex"));
             }
@@ -758,16 +792,16 @@ fn read_decl(
             Ok(Value::Graph(graph))
         }
         Decl::Graph { name, edges, verts } => {
-            let n = resolve(verts, env, name)?;
-            let m = resolve(edges, env, name)?;
+            let n = resolve(schema, verts, current, name)?;
+            let m = resolve(schema, edges, current, name)?;
             let list = read_edges(cursor, m, n, name)?;
             Ok(Value::Graph(GraphCase { n, edges: list }))
         }
         Decl::Repeat { count, body } => {
-            let k = resolve(count, env, "repeat")?;
+            let k = resolve(schema, count, current, "repeat")?;
             let mut iters = Vec::with_capacity(k);
             for _ in 0..k {
-                iters.push(read_block(body, cursor, env)?);
+                iters.push(read_block(schema, body, cursor, current)?);
             }
             Ok(Value::Repeat(iters))
         }
@@ -946,53 +980,51 @@ impl SchemaData {
     /// each structural edit, which is what makes a mismatched count field
     /// impossible to emit.
     pub fn resync(&mut self) {
-        let items = Rc::clone(&self.schema);
-        resync_block(&items.items, &mut self.values);
+        let schema = Rc::clone(&self.schema);
+        resync_block(&schema, &schema.items, &mut self.values);
     }
 }
 
-fn resync_block(items: &[Decl], values: &mut [Value]) {
-    // name -> index of its Int slot in this block
-    let mut slot: HashMap<&str, usize> = HashMap::new();
+fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
+    // What each sizing reference is actually sizing, measured from the data.
+    let mut sizes: Vec<(&Ref, usize)> = Vec::new();
     for (i, decl) in items.iter().enumerate() {
-        if let Decl::Int { name, .. } = decl {
-            slot.insert(name.as_str(), i);
-        }
-    }
-
-    let mut updates: Vec<(usize, i64)> = Vec::new();
-    for (i, decl) in items.iter().enumerate() {
-        let mut set = |r: &Ref, v: usize| {
-            if let Ref::Name(n) = r {
-                if let Some(idx) = slot.get(n.as_str()) {
-                    updates.push((*idx, v as i64));
-                }
-            }
-        };
         match (decl, &values[i]) {
-            (Decl::Array { len, .. }, Value::Array(arr)) => set(len, arr.len()),
+            (Decl::Array { len, .. }, Value::Array(arr)) => sizes.push((len, arr.len())),
             (Decl::Matrix { rows, cols, .. }, Value::Matrix(grid)) => {
-                set(rows, grid.len());
-                set(cols, grid.first().map_or(0, |r| r.len()));
+                sizes.push((rows, grid.len()));
+                sizes.push((cols, grid.first().map_or(0, |r| r.len())));
             }
-            (Decl::Tree { verts, .. }, Value::Graph(g)) => set(verts, g.n),
+            (Decl::Tree { verts, .. }, Value::Graph(g)) => sizes.push((verts, g.n)),
             (Decl::Graph { edges, verts, .. }, Value::Graph(g)) => {
-                set(edges, g.edges.len());
-                set(verts, g.n);
+                sizes.push((edges, g.edges.len()));
+                sizes.push((verts, g.n));
             }
-            (Decl::Repeat { count, .. }, Value::Repeat(iters)) => set(count, iters.len()),
+            (Decl::Repeat { count, .. }, Value::Repeat(iters)) => sizes.push((count, iters.len())),
             _ => {}
         }
     }
-    for (idx, v) in updates {
-        values[idx] = Value::Int(v);
+
+    for (r, size) in sizes {
+        let Ref::Name(n) = r else { continue };
+        let Some(id) = schema.count_id(n) else {
+            continue;
+        };
+        // `values` is this block's own instantiation, so the count's static
+        // slot index addresses this instance and no other. That is the whole
+        // reason a count declared inside a repeat can differ per iteration.
+        if let Some(target) = values.get_mut(schema.count_slot(id)) {
+            if matches!(target, Value::Int(_)) {
+                *target = Value::Int(size as i64);
+            }
+        }
     }
 
     // Recurse after the counts in this block are settled.
     for (i, decl) in items.iter().enumerate() {
         if let (Decl::Repeat { body, .. }, Value::Repeat(iters)) = (decl, &mut values[i]) {
             for iter in iters {
-                resync_block(body, iter);
+                resync_block(schema, body, iter);
             }
         }
     }
@@ -1672,6 +1704,109 @@ repeat T {
         assert_ne!(t_axis, n_axis, "different counts must not share an axis");
         assert_eq!(schema.axis(t_axis).count, schema.count_id("T").unwrap());
         assert_eq!(schema.axis(n_axis).count, schema.count_id("N").unwrap());
+    }
+
+    /// Invariant 15 of the design note, and the case that caught revision 5.
+    ///
+    /// One `int N` declaration, three live instances, three different values.
+    /// A `CountId` names the declaration; the cardinality lives in each
+    /// iteration's own slot. Anything that stores a cardinality *on* the count
+    /// collapses these three into one and fails here.
+    #[test]
+    fn a_count_inside_a_repeat_differs_per_iteration() {
+        let text = "int T in 1..10\nrepeat T {\n  int N in 1..10\n  \
+                    array A[N] in -1000..1000\n}\n";
+        let data = build(text, "3\n2\n5 6\n3\n-7 8 9\n1\n4\n");
+
+        let ns = |d: &SchemaData| -> Vec<i64> {
+            let Value::Repeat(iters) = &d.values[1] else {
+                panic!("expected a repeat")
+            };
+            iters
+                .iter()
+                .map(|iter| match &iter[0] {
+                    Value::Int(v) => *v,
+                    other => panic!("expected the count, got {other:?}"),
+                })
+                .collect()
+        };
+        let lens = |d: &SchemaData| -> Vec<usize> {
+            let Value::Repeat(iters) = &d.values[1] else {
+                panic!("expected a repeat")
+            };
+            iters
+                .iter()
+                .map(|iter| match &iter[1] {
+                    Value::Array(a) => a.len(),
+                    other => panic!("expected the array, got {other:?}"),
+                })
+                .collect()
+        };
+
+        assert_eq!(ns(&data), vec![2, 3, 1], "one CountId, three values");
+        assert_eq!(lens(&data), vec![2, 3, 1]);
+
+        // Resync must not make the instances agree with one another.
+        let mut resynced = data.clone();
+        resynced.resync();
+        assert_eq!(
+            resynced, data,
+            "resync disturbed an already consistent model"
+        );
+        assert_eq!(ns(&resynced), vec![2, 3, 1]);
+
+        // Editing one iteration must leave every other iteration's count alone.
+        let mut edited = data.clone();
+        let Value::Repeat(iters) = &mut edited.values[1] else {
+            panic!()
+        };
+        iters[1] = vec![Value::Int(3), Value::Array(vec![-7])];
+        edited.resync();
+
+        assert_eq!(
+            ns(&edited),
+            vec![2, 1, 1],
+            "only the edited iteration's count should have moved"
+        );
+        assert_eq!(lens(&edited), vec![2, 1, 1]);
+
+        // And the result is still a legal input that reads back identically.
+        let rendered = edited.render();
+        assert_eq!(parse_input(&edited.schema, &rendered).unwrap(), edited);
+    }
+
+    /// The same independence has to survive an actual reduction, not just a
+    /// hand-made edit.
+    #[test]
+    fn reduction_keeps_repeat_instances_independent() {
+        let text = "int T in 1..10\nrepeat T {\n  int N in 1..10\n  \
+                    array A[N] in -1000..1000\n}\n";
+        let data = build(text, "3\n2\n5 6\n3\n-7 8 9\n1\n4\n");
+
+        // Keep at least two iterations alive so independence is observable.
+        let reduced = reduce(&data, |t| {
+            let ints = ints(t);
+            ints.first() == Some(&3) && ints.iter().any(|v| *v < 0)
+        });
+
+        let Value::Repeat(iters) = &reduced.values[1] else {
+            panic!("expected a repeat")
+        };
+        assert_eq!(iters.len(), 3, "the predicate pinned T at 3");
+        for (i, iter) in iters.iter().enumerate() {
+            let (Value::Int(n), Value::Array(a)) = (&iter[0], &iter[1]) else {
+                panic!("unexpected shape in iteration {i}")
+            };
+            assert_eq!(
+                *n as usize,
+                a.len(),
+                "iteration {i}: count {n} does not match its own array"
+            );
+        }
+        assert_eq!(
+            parse_input(&reduced.schema, &reduced.render()).unwrap(),
+            reduced
+        );
     }
 
     #[test]
