@@ -1,14 +1,23 @@
 # Shared dimensions — design note for v0.5
 
-Status: proposal, revision 2. No code written. Uncommitted.
+Status: proposal, revision 3. No code written.
 
-Revision 2 rewrites the core model after review. Five things in revision 1 were
-wrong; the corrections are recorded in §12 rather than quietly folded in,
-because two of them were errors of reasoning rather than detail and the shape of
-the mistake is worth keeping.
+Revision 2 separated Count from Axis. Revision 3 resolves the three questions
+that left open: permutations, count-shrink propagation across several axes, and
+where axis independence lives in the model. What each revision got wrong is kept
+in §13 and §14 rather than folded in silently.
 
-The headline change: revision 1 treated a shared count as implying a shared
-selection. It does not. **A count owns cardinality; it does not own identity.**
+The model in one line:
+
+```text
+Count     how many        cardinality, written to the file
+Axis      which           positional identity
+Index     that one        a reference naming a position on an axis
+Relation  and therefore   legality, and selections induced on other axes
+```
+
+Revision 1 collapsed the first two. Revision 2 collapsed the last two, by
+reaching for a `permutation` element kind instead of a relation.
 
 ---
 
@@ -36,10 +45,10 @@ Three consequences:
 
 ---
 
-## 2. Three concepts, not one
+## 2. Four concepts, not one
 
-Revision 1 had a single `Dimension`. That was the root error. There are three
-distinct things:
+Revision 1 had a single `Dimension`. That was the root error. There are four
+distinct things, and each revision has found one more of them:
 
 **Count** — a cardinality, written to the file as a token. `N` in `array A[N]`.
 This is what the grammar constrains: one token, one number, every collection
@@ -50,9 +59,14 @@ particular thing, and if two collections are indexed by the same axis then their
 position 3 is the same thing. This is what makes `X[i]`, `Y[i]` the coordinates
 of point `i`.
 
-**Reference** — a value that names a position on an axis. A graph endpoint. When
-the axis is reduced, references must be remapped, and holders of dead references
-must be dropped.
+**Reference** (`Index`) — a value that names a position on an axis. A graph
+endpoint. When the axis is reduced, references must be remapped, and holders of
+dead references must be dropped.
+
+**Relation** — a stated fact tying two axes together, which both restricts legal
+selections and *induces* selections on the other side. `Bijection` is the first
+one, and it is what a permutation is (§9). Revision 2 missed this layer and
+tried to solve permutations with an element kind instead.
 
 An axis has a count. Several axes may share one count. That is the distinction
 revision 1 collapsed:
@@ -188,7 +202,8 @@ apply(axis, mask):
                 keep[a2] &= m2
                 if keep[a2] != before:      # enqueue only on an actual shrink
                     push(a2)
-    for each count c: extent(c) = |keep[any axis of c]|
+    for each count c: extent(c) = min |keep[a]| over axes a of c
+    trim any axis of c that still retains more than extent(c)
     relabel every Index reference through the retained-position mapping
 ```
 
@@ -196,6 +211,40 @@ Termination: the state is a finite product lattice of bitmasks, every update is
 `&=` so it descends monotonically, and an axis is enqueued only when its mask
 strictly shrinks. Bounded by total positions, and now actually provable rather
 than asserted.
+
+### Count shrinking across several axes
+
+Revision 2 wrote `extent(c) = |keep[any axis of c]|`. That assumes every axis of
+a count carries the same mask, which holds only when they are the same axis.
+Consider:
+
+```text
+int N
+int M
+graph E[M] vertices N
+array Foo[M]              # same count, independent axis
+```
+
+Shrinking `N` kills edges, so the edge axis goes `10 -> 7` and count `M` becomes
+7. `Foo` must also reach 7 — but *which* three positions does it drop? Nothing
+in the cascade determines that, because nothing constrained `Foo`.
+
+The rule:
+
+```text
+extent(c) = min over axes a of count c of |keep[a]|
+every axis of c with |keep[a]| > extent(c) is trimmed by the canonical rule
+```
+
+**Canonical rule: mirror the mask of the axis that drove the shrink.** Every
+axis of a count starts at the same extent — the count was a single number at
+parse time — so mirroring is always well defined. It is deterministic, and it is
+the least damaging choice if the axes turn out to be correlated after all.
+Phase B may explore alternatives later.
+
+Taking the *minimum* rather than any particular axis keeps the update monotone,
+so the termination argument above survives unchanged: the extra trimming only
+removes positions.
 
 ### Cardinality coupling
 
@@ -242,6 +291,12 @@ enum SelectionConstraint {
 `Connected` from the tree wins over the graph's "anything goes". Two trees on
 one vertex set need a selection connected in both.
 
+**Independence is not a constraint.** Two declarations on distinct `AxisId`s
+sharing a `CountId` already say "same size, different identity"; two on the same
+`AxisId` say "same identity". The topology carries it. `SelectionConstraint` is
+for legality predicates — `Connected`, `NonEmpty` — and an `Independent` variant
+would be a category error.
+
 The candidate *generator* may stay specialised (leaf pruning for trees), but
 **validity is checked compositionally**. That split matters: a specialised
 generator that happens to violate another subscriber's constraint is caught
@@ -273,6 +328,12 @@ inputs. Corrected set:
 9. **Cascade termination** — `apply` reaches a fixpoint; masks only descend.
 10. **Constraint satisfaction** — every accepted candidate satisfies every
     subscriber's constraints, checked as an intersection, not by kind.
+11. **Bijection preservation** — for a `Bijection(a, b)`, the mapping restricted
+    to `keep[a]` is a bijection onto `keep[b]`. Follows by construction when the
+    cascade uses image and preimage (§9), so this is a check that the cascade
+    was implemented as designed.
+12. **Count minimum** — `extent(c) == min |keep[a]|` over the axes of `c`, and
+    no axis of `c` retains more positions than that.
 
 1, 5 and 7 are what the existing harness already covers for the built-in shapes.
 2, 6, 9 and 10 are new and are where I expect the first bugs.
@@ -300,7 +361,87 @@ engine and differ in semantics. That distinction is the whole content of §3's
 
 ---
 
-## 9. Roadmap
+## 9. Permutations are a relation, not an element kind
+
+Revision 2 leaned toward a `permutation` element kind. That is wrong for the
+same reason inferring `Index` from `1..N` is wrong: permutation is not a
+property any element has. The element `3` does not know whether it sits in a
+permutation. The property belongs to the whole collection:
+
+```text
+len(P) == N,   1 <= P[i] <= N,   all distinct,   set(P) == 1..N
+```
+
+That is exactly a **bijection between two axes**:
+
+```text
+P: Vector { axis: PositionAxis, elem: Index(ValueAxis) }
+   Bijection(PositionAxis, ValueAxis)
+   count(PositionAxis) == count(ValueAxis) == N
+```
+
+Two axes, one count — the structure §2 already introduced. No new element kind
+is needed, only a relation:
+
+```rust
+enum Relation {
+    Bijection { domain: AxisId, codomain: AxisId, mapping: DeclId },
+}
+```
+
+### It preserves permutation-ness for free
+
+The cascade does the work. A selection on positions induces one on values
+through the **image** of the mapping; a selection on values induces one on
+positions through the **preimage**. Because the mapping is bijective the two
+sides always have equal cardinality, which is exactly what the shared count
+requires.
+
+`N = 5`, `P = [3, 5, 1, 4, 2]`, with `color` on the position axis and `weight`
+on the value axis. Simulated against the model:
+
+| operation | N | P | color | weight | still a permutation |
+| --- | --- | --- | --- | --- | --- |
+| keep positions {1,3,5} | 3 | `3 1 2` | c1 c3 c5 | w1 w2 w3 | yes |
+| keep positions {2,4} | 2 | `2 1` | c2 c4 | w4 w5 | yes |
+| drop value 4 | 4 | `3 4 1 2` | c1 c2 c3 c5 | w1 w2 w3 w5 | yes |
+| keep values {1,2} | 2 | `1 2` | c3 c5 | w1 w2 | yes |
+
+No clamping, no dropping of arbitrary elements, no per-integer special case —
+and `color` follows positions while `weight` follows values, each through its
+own axis. This is the litmus test for the whole Count/Axis/Reference split, and
+the model passes it in both directions.
+
+### Do not infer it from `in 1..N`
+
+The same discipline as `Int` versus `Index`. These are different types:
+
+```text
+array A[N] in 1..N      Vector<N_axis, Int(bounds = 1..N)>
+                        N shrinks  ->  values are CLAMPED
+                        [1, 1, 5, 2, 5] is perfectly legal
+
+permutation P[N]        Vector<PositionAxis, Index(ValueAxis)>
+                        + Bijection(PositionAxis, ValueAxis)
+                        N shrinks  ->  positions selected, values REMAPPED
+```
+
+`array A[N] in 1..N` must not become a permutation because a bound looks like
+one.
+
+### What it forces on the syntax
+
+A permutation introduces *two* axes on one count, which makes a bare
+`array color[N]` ambiguous: position axis, value axis, or a third independent
+axis sharing the count? The model can express all three; v0.4 syntax cannot say
+which. **Axis naming is therefore a syntax requirement, not a nicety** — it
+falls out of the litmus test rather than from wanting a richer language. Some
+form of `array color[P.positions]` / `array weight[P.values]` is needed before
+permutations are usable.
+
+---
+
+## 10. Roadmap
 
 ```
 0. Freeze v0.4 with benchcases.
@@ -320,7 +461,7 @@ messy one. `proptest.rs` already drives the reducer through a pure in-memory
 
 ---
 
-## 10. A falsifiable test that survives review
+## 11. Falsifiable tests
 
 Revision 1 proposed: *"allowing sharing should require deleting a validation
 check; if it needs new code the model is wrong."*
@@ -329,14 +470,18 @@ That test is void. Once same-count and same-axis are distinct, allowing sharing
 needs new **information** in the syntax — which is not evidence of a bad
 abstraction, only that v0.4's syntax cannot express the distinction.
 
-Replacement, aimed at the part that should be load-bearing:
+Revision 2's replacement was also wrong, in a smaller way: it proposed that
+independent axes need "one new `SelectionConstraint` variant". Independence is
+not a constraint — it is which `AxisId` a declaration points at (§6). Sharper:
 
-> Adding independent axes (step 5) should require **a syntax addition and one
-> new `SelectionConstraint` variant, with no change to the cascade engine in
-> §5.** If the fixpoint has to learn about axis independence, the dataflow model
-> is wrong.
+> Adding syntax for independent axes should only change **which `AxisId` a
+> declaration lowers to**. It must not introduce a new semantic operation.
 
-And a second, cheaper one:
+The parser decides `shared identity -> same AxisId` versus `same count only ->
+distinct AxisIds sharing a CountId`. The cascade already knows the Count/Axis
+relation and never needs to know what the user typed.
+
+A second, cheaper one:
 
 > Step 4 should **delete** `GraphCase::induced` and the bespoke tree pruning,
 > replacing them with an `Index` cascade plus a `Connected` constraint. If both
@@ -344,13 +489,18 @@ And a second, cheaper one:
 
 ---
 
-## 11. Open questions
+## 12. Open questions
 
-- **Permutations.** `array A[N] in 1..N` is a real format. Shrinking `N` leaves
-  values out of range; clamping breaks permutation-ness and dropping is not
-  available for a non-record element. Probably needs a `permutation` element
-  kind that reduces by *removing a value and renumbering*, i.e. behaves like an
-  axis rather than a bounded int. Unresolved.
+- ~~**Permutations.**~~ Resolved in §9: a bijection between two axes, not an
+  element kind. `array A[N] in 1..N` stays a clamped `Int`; `permutation P[N]`
+  becomes two axes plus a relation.
+- **Axis naming syntax.** Forced by §9. `array color[N]` is ambiguous once a
+  count carries more than one axis. Needs designing before permutations ship,
+  and it interacts with how independent axes are declared (§2).
+- **Are there relations beyond bijection?** Injection would cover "each query
+  names a distinct element"; a general many-to-one would cover most reference
+  patterns. `Bijection` may be the wrong first abstraction if a weaker one is
+  the common case.
 - **Can an axis exist with no collection?** `graph ... vertices N` has a vertex
   set with no stored data; its extent is the count itself. Tree and graph
   already behave this way, so probably yes, but it means an axis may have no
@@ -368,7 +518,7 @@ And a second, cheaper one:
 
 ---
 
-## 12. What revision 1 got wrong
+## 13. What revision 1 got wrong
 
 Kept deliberately: the errors were in the reasoning, not the details.
 
@@ -395,3 +545,26 @@ Kept deliberately: the errors were in the reasoning, not the details.
 
 Corrections 1, 2 and 5 came from external review; 3 and 4 were confirmed against
 the v0.4 source while checking them.
+
+---
+
+## 14. What revision 2 got wrong
+
+1. **Reached for a `permutation` element kind.** Permutation is a collection
+   property, not an element property — the value `3` cannot know whether it sits
+   in one. It is a bijection between two axes, which the Count/Axis split of
+   revision 2 had already made expressible. Revision 2 introduced the machinery
+   and then failed to use it.
+2. **Left count-shrink propagation undefined for several axes.**
+   `extent(c) = |keep[any axis of c]|` is only correct when every axis of the
+   count carries the same mask. With independent axes it says nothing about
+   which positions the unconstrained ones drop. Fixed by the minimum rule and a
+   canonical mirror in §5.
+3. **Treated axis independence as a `SelectionConstraint`.** A category error:
+   independence is the topology of the model — which `AxisId` a declaration
+   points at — not a predicate on legal selections. `SelectionConstraint` is for
+   `Connected` and its kin.
+
+All three came from external review. The permutation litmus test in §9 was then
+simulated against the model before being written down, in both the position-to-
+value and value-to-position directions.
