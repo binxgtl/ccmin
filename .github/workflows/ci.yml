@@ -68,3 +68,29 @@ jobs:
             --checker-arg testdata/checker/checker.py \
             --iters 1 --no-save --no-color && code=0 || code=$?
           test "$code" -eq 1
+      # The declared constraints must change the answer, not merely be accepted.
+      # Without the schema the reducer reaches a value of 0, which the statement
+      # forbids; with it, the reduced case sits on the real threshold.
+      - name: schema constraints end-to-end
+        shell: bash
+        run: |
+          set -x
+          cargo run --release -- \
+            --sol testdata/schema/sol.cpp \
+            --brute testdata/schema/brute.cpp \
+            --gen testdata/schema/gen.cpp \
+            --no-save --no-color > unconstrained.txt && code=0 || code=$?
+          test "$code" -eq 1
+
+          cargo run --release -- \
+            --sol testdata/schema/sol.cpp \
+            --brute testdata/schema/brute.cpp \
+            --gen testdata/schema/gen.cpp \
+            --schema testdata/schema/input.schema \
+            --no-save --no-color > constrained.txt && code=0 || code=$?
+          test "$code" -eq 1
+
+          # Unconstrained reduction leaves the legal range; constrained does not.
+          grep -qx '0' unconstrained.txt
+          grep -qx '500000' constrained.txt
+          ! grep -qx '0' constrained.txt

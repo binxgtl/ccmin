@@ -9,6 +9,7 @@
 
 use crate::model::{ArrayCase, GraphCase, Model};
 use crate::oracle::{FailKind, Judge};
+use crate::reduce::{ddmin, ddmin_allow_empty, shrink_ints, shrink_value};
 
 pub struct Shrinker<'a> {
     judge: &'a mut dyn Judge,
@@ -88,6 +89,11 @@ impl<'a> Shrinker<'a> {
             }
             Model::Tree(tree) => Model::Tree(self.shrink_tree(tree)),
             Model::Graph(graph) => Model::Graph(self.shrink_graph(graph)),
+            Model::Schema(data) => {
+                Model::Schema(data.structural_pass(&mut |candidate| {
+                    self.accept(&Model::Schema(candidate.clone()))
+                }))
+            }
             Model::Raw(lines) => {
                 // Drop whole lines first, then thin out the tokens on each
                 // surviving line. Without the second step a single-line input
@@ -227,6 +233,9 @@ impl<'a> Shrinker<'a> {
                 }
                 Model::MultiTest(out)
             }
+            Model::Schema(data) => Model::Schema(
+                data.value_pass(&mut |candidate| self.accept(&Model::Schema(candidate.clone()))),
+            ),
             Model::Tree(_) | Model::Graph(_) => m.clone(),
             // Raw values are not necessarily numeric; leave them alone.
             Model::Raw(_) => m.clone(),
@@ -234,179 +243,10 @@ impl<'a> Shrinker<'a> {
     }
 }
 
-/// Classic ddmin: try removing progressively finer chunks, restarting at a
-/// coarser granularity whenever a removal sticks.
-fn ddmin<T: Clone>(items: &[T], mut accept: impl FnMut(&[T]) -> bool) -> Vec<T> {
-    let mut cur = items.to_vec();
-    if cur.is_empty() {
-        return cur;
-    }
-    let mut n = 2usize;
-    while cur.len() >= 2 {
-        let chunk = cur.len().div_ceil(n);
-        let mut reduced = false;
-        let mut start = 0usize;
-        while start < cur.len() {
-            let end = (start + chunk).min(cur.len());
-            let mut cand = Vec::with_capacity(cur.len() - (end - start));
-            cand.extend_from_slice(&cur[..start]);
-            cand.extend_from_slice(&cur[end..]);
-            if accept(&cand) {
-                cur = cand;
-                n = n.saturating_sub(1).max(2);
-                reduced = true;
-                break;
-            }
-            start = end;
-        }
-        if !reduced {
-            if n >= cur.len() {
-                break;
-            }
-            n = (n * 2).min(cur.len());
-        }
-    }
-    cur
-}
-
-fn ddmin_allow_empty<T: Clone>(items: &[T], mut accept: impl FnMut(&[T]) -> bool) -> Vec<T> {
-    let current = ddmin(items, &mut accept);
-    if !current.is_empty() && accept(&[]) {
-        Vec::new()
-    } else {
-        current
-    }
-}
-
-fn shrink_ints(vals: &[i64], mut accept: impl FnMut(&[i64]) -> bool) -> Vec<i64> {
-    let mut cur = vals.to_vec();
-    let mut improved = true;
-    let mut rounds = 0;
-    while improved && rounds < 16 {
-        improved = false;
-        rounds += 1;
-        for i in 0..cur.len() {
-            let original = cur[i];
-            let candidate = shrink_value(original, |cand| {
-                let mut next = cur.clone();
-                next[i] = cand;
-                accept(&next)
-            });
-            if candidate != original {
-                cur[i] = candidate;
-                improved = true;
-            }
-        }
-    }
-    cur
-}
-
-/// Find the smallest accepted magnitude between zero and `x`. The predicate is
-/// expected to have a boundary along that interval, which is the common shape
-/// of numeric bugs (`x >= limit`, overflow thresholds, negative bounds). The
-/// returned value is always one that was actually accepted.
-fn shrink_value(x: i64, mut accept: impl FnMut(i64) -> bool) -> i64 {
-    if x == 0 {
-        return x;
-    }
-    if accept(0) {
-        return 0;
-    }
-
-    let magnitude = x.unsigned_abs();
-    if magnitude == 1 {
-        return x;
-    }
-    if accept(x.signum()) {
-        return x.signum();
-    }
-
-    let negative = x < 0;
-    let mut low = 2u64;
-    let mut high = magnitude;
-    let mut best = x;
-    while low < high {
-        let mid = low + (high - low) / 2;
-        let candidate = signed_magnitude(mid, negative);
-        if accept(candidate) {
-            best = candidate;
-            high = mid;
-        } else {
-            low = mid + 1;
-        }
-    }
-    if low < magnitude {
-        let candidate = signed_magnitude(low, negative);
-        if accept(candidate) {
-            best = candidate;
-        }
-    }
-    best
-}
-
-fn signed_magnitude(magnitude: u64, negative: bool) -> i64 {
-    if negative {
-        if magnitude == 1u64 << 63 {
-            i64::MIN
-        } else {
-            -(magnitude as i64)
-        }
-    } else {
-        magnitude as i64
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::oracle::Oracle;
-
-    #[test]
-    fn ddmin_finds_single_required_element() {
-        // Failure condition: the sentinel 42 must be present.
-        let items: Vec<i64> = (0..64).collect::<Vec<_>>();
-        let mut items = items;
-        items[30] = 42;
-        let out = ddmin(&items, |c| c.contains(&42));
-        assert_eq!(out, vec![42]);
-    }
-
-    #[test]
-    fn ddmin_keeps_two_required_elements() {
-        let items: Vec<i64> = (0..32).collect();
-        let out = ddmin(&items, |c| c.contains(&5) && c.contains(&20));
-        assert_eq!(out, vec![5, 20]);
-    }
-
-    #[test]
-    fn boundary_search_reaches_large_threshold_in_logarithmic_calls() {
-        let mut calls = 0;
-        let out = shrink_value(1_000_000_000_000_000_000, |candidate| {
-            calls += 1;
-            candidate >= 1_000_000_000
-        });
-        assert_eq!(out, 1_000_000_000);
-        assert!(calls <= 66, "used {calls} predicate calls");
-    }
-
-    #[test]
-    fn boundary_search_handles_i64_min_without_overflow() {
-        let out = shrink_value(i64::MIN, |candidate| candidate <= -1_000_000_000);
-        assert_eq!(out, -1_000_000_000);
-    }
-
-    #[test]
-    fn shrink_ints_pulls_to_minimum() {
-        // Failure condition: some element is negative.
-        let out = shrink_ints(&[500, -900_000, 12], |c| c.iter().any(|v| *v < 0));
-        assert_eq!(out, vec![0, -1, 0]);
-    }
-
-    #[test]
-    fn graph_ddmin_can_remove_the_final_edge() {
-        let out = ddmin_allow_empty(&[42], |_| true);
-        assert!(out.is_empty());
-    }
 
     /// Records every candidate the reducer asks about. Failure condition is
     /// "some value is negative", which is the shape of the demo's bug.

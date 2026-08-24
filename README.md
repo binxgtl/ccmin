@@ -216,6 +216,77 @@ Note that `vcvars64.bat` takes several seconds, so the first compile step is
 noticeably slower on MSVC than on `g++`. All three programs are built in a
 single batch so you pay that cost once rather than three times.
 
+## Telling ccmin the constraints
+
+Auto-detection has to guess what an input means, which is why it is deliberately
+conservative — a wrong guess corrupts the format. A schema does not guess. You
+write the grammar down, so widening what ccmin can reduce does not widen what it
+can get wrong.
+
+It is also where the constraints live, and constraints are the difference
+between a useful reduced case and a misleading one:
+
+```text
+# input.schema -- the problem statement, written down
+int N in 1..50
+array A[N] in 1..1000000
+```
+
+```bash
+ccmin --schema input.schema
+```
+
+The example under `testdata/schema` has a solution that is wrong for values
+`>= 500000`. Reducing it without a schema gives:
+
+```
+1
+0
+```
+
+That is a real disagreement, and it is useless: the statement guarantees
+`1 <= a_i`, so a judge would never produce it. Unconstrained value shrinking
+heads for zero and finds a bug you cannot reach. With the schema:
+
+```
+1
+500000
+```
+
+Same programs, same run — but now the reduced case sits exactly on the
+threshold of the real bug, and it is an input the problem actually permits.
+
+### The schema language
+
+One declaration per line; `#` starts a comment. Every `in lo..hi` is optional,
+and either side may be omitted (`in 1..`, `in ..100`).
+
+```text
+int N in 1..1000                  a single value
+array A[N] in -1000000000..1000000000
+matrix G[R][C] in 0..1            R rows of C values
+tree E vertices N                 N-1 edges, checked connected and acyclic
+graph E[M] vertices N             M one-based edges
+repeat T {                        the block, T times
+  int K in 1..100
+  array B[K]
+}
+```
+
+Count fields (`N` in `array A[N]`) are **derived**: they are recomputed from the
+data after every edit and never shrunk on their own, so a declared length cannot
+drift out of step with what follows it. A bound on a count is a floor on the
+structure — `int N in 1..50` means the array is never emptied. A literal count
+(`array A[3]`) is fixed and its length is left alone.
+
+Two restrictions, both reported clearly rather than silently mishandled: a name
+may be used as a count by only one declaration (otherwise the two would have to
+shrink in lockstep), and a count must be declared in the same block as the thing
+it sizes.
+
+`--schema` is mutually exclusive with `--shape` and `--guess-header`, since a
+schema already states what those would try to infer.
+
 ## What it does not do yet
 
 Being specific about this, because a shrinker that quietly mangles your input
@@ -224,9 +295,11 @@ is worse than no shrinker:
 - **Weighted edges, per-vertex data and geometry are not modelled.** Use raw
   mode for those formats; tree and graph shapes currently cover unweighted
   one-based edge lists only.
-- **Constraints are not read.** If the problem says `1 <= a_i <= 10^9`, `ccmin`
-  may shrink a value to `0`. Nothing parses the statement. A `--min-value` flag
-  is the likely fix.
+- **Constraints apply only under `--schema`.** Without one, nothing knows the
+  problem's bounds and a value may be shrunk to `0` when the statement forbids
+  it. Auto-detected shapes have no constraint information at all.
+- **Schema inputs must be entirely integers.** Strings and mixed formats fall
+  back to raw mode.
 - **Only the failure kind is preserved, not the specific wrong answer.** A
   shrink that changes *how* the outputs differ is still accepted.
 - **Single tokens are not shrunk.** A long string stays a long string; only

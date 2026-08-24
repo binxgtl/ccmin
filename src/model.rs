@@ -125,6 +125,8 @@ pub enum Model {
     Tree(GraphCase),
     /// `N M` followed by exactly `M` unweighted edges.
     Graph(GraphCase),
+    /// A grammar the user declared, with constraints. See `schema.rs`.
+    Schema(crate::schema::SchemaData),
     /// Unrecognised shape. Shrunk at the token level, validity not guaranteed.
     Raw(Vec<Vec<String>>),
 }
@@ -140,10 +142,13 @@ pub enum Shape {
     Raw,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ParseOptions {
     pub shape: Shape,
     pub n_index: Option<usize>,
+    /// When set, the input is read against this declared grammar and no
+    /// inference happens at all.
+    pub schema: Option<std::rc::Rc<crate::schema::Schema>>,
     /// In auto mode, also try two- and three-field array headers. This is
     /// deliberately opt-in because a coincidental count can corrupt a format
     /// that is not actually an array.
@@ -164,6 +169,7 @@ impl Model {
             }
             Model::Tree(tree) => tree.render_tree_into(&mut out),
             Model::Graph(graph) => graph.render_graph_into(&mut out),
+            Model::Schema(data) => out.push_str(&data.render()),
             Model::Raw(lines) => {
                 for l in lines {
                     out.push_str(&l.join(" "));
@@ -180,6 +186,7 @@ impl Model {
             Model::Array(c) => c.arr.len(),
             Model::MultiTest(tests) => tests.iter().map(|t| t.arr.len()).sum::<usize>(),
             Model::Tree(tree) | Model::Graph(tree) => tree.n + tree.edges.len(),
+            Model::Schema(data) => data.size(),
             Model::Raw(lines) => lines.iter().map(|l| l.len()).sum(),
         }
     }
@@ -188,6 +195,7 @@ impl Model {
         match self {
             Model::Array(_) | Model::MultiTest(_) => "value",
             Model::Tree(_) | Model::Graph(_) => "graph item",
+            Model::Schema(_) => "value",
             Model::Raw(_) => "token",
         }
     }
@@ -198,6 +206,7 @@ impl Model {
             Model::MultiTest(_) => "multi-test",
             Model::Tree(_) => "tree",
             Model::Graph(_) => "graph",
+            Model::Schema(_) => "schema",
             Model::Raw(_) => "raw tokens",
         }
     }
@@ -220,6 +229,7 @@ impl Model {
             Model::Array(c) => acc(&c.arr),
             Model::MultiTest(tests) => tests.iter().for_each(|t| acc(&t.arr)),
             Model::Tree(_) | Model::Graph(_) => {}
+            Model::Schema(data) => return data.avg_magnitude(),
             Model::Raw(lines) => {
                 for l in lines {
                     for tok in l {
@@ -240,6 +250,10 @@ impl Model {
 }
 
 pub fn parse_with(text: &str, options: ParseOptions) -> Result<Model, String> {
+    if let Some(schema) = &options.schema {
+        return crate::schema::parse_input(schema, text).map(Model::Schema);
+    }
+
     let lines: Vec<Vec<String>> = text
         .lines()
         .map(|l| l.split_whitespace().map(str::to_string).collect())
@@ -572,6 +586,7 @@ mod tests {
         let parsed = parse_with(
             "99 3\n1 2 3\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Array,
                 n_index: Some(1),
                 guess_header: false,
@@ -589,6 +604,7 @@ mod tests {
         let parsed = parse_with(
             "3\n1 2 3\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Raw,
                 ..ParseOptions::default()
             },
@@ -602,6 +618,7 @@ mod tests {
         let result = parse_with(
             "4\n1 2 3\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Array,
                 ..ParseOptions::default()
             },
@@ -614,6 +631,7 @@ mod tests {
         let parsed = parse_with(
             "4\n1 2\n2 3\n2 4\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Tree,
                 ..ParseOptions::default()
             },
@@ -630,6 +648,7 @@ mod tests {
         let result = parse_with(
             "4\n1 2\n2 3\n3 1\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Tree,
                 ..ParseOptions::default()
             },
@@ -642,6 +661,7 @@ mod tests {
         let parsed = parse_with(
             "4 3\n1 2\n2 3\n4 4\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Graph,
                 ..ParseOptions::default()
             },
@@ -678,6 +698,7 @@ mod tests {
         let result = parse_with(
             "3 1\n1 4\n",
             ParseOptions {
+                schema: None,
                 shape: Shape::Graph,
                 ..ParseOptions::default()
             },
@@ -698,6 +719,7 @@ mod tests {
             let reparsed = parse_with(
                 &Model::Array(candidate.clone()).render(),
                 ParseOptions {
+                    schema: None,
                     shape: Shape::Array,
                     n_index: Some(1),
                     guess_header: false,
@@ -733,6 +755,7 @@ mod tests {
             let reparsed = parse_with(
                 &Model::Graph(candidate.clone()).render(),
                 ParseOptions {
+                    schema: None,
                     shape: Shape::Graph,
                     ..ParseOptions::default()
                 },

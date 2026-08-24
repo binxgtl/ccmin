@@ -155,6 +155,7 @@ fn options_for(m: &Model) -> ParseOptions {
         Model::Array(c) => ParseOptions {
             shape: Shape::Array,
             n_index: Some(c.n_idx),
+            schema: None,
             guess_header: false,
         },
         Model::MultiTest(_) => ParseOptions {
@@ -173,6 +174,9 @@ fn options_for(m: &Model) -> ParseOptions {
             shape: Shape::Raw,
             ..ParseOptions::default()
         },
+        // Not produced by these generators; schema inputs have their own tests
+        // in schema.rs, where the declared grammar is available.
+        Model::Schema(_) => ParseOptions::default(),
     }
 }
 
@@ -218,6 +222,9 @@ fn assert_structurally_valid(m: &Model, context: &str) {
             );
         }
         Model::Graph(graph) => assert_endpoints_in_range(graph, context),
+        // Schema inputs are generated and checked in schema.rs, where the
+        // declared grammar is available to check against.
+        Model::Schema(_) => {}
         Model::Raw(_) => {}
     }
 }

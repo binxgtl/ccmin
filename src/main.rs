@@ -6,6 +6,8 @@ mod oracle;
 mod proc;
 #[cfg(test)]
 mod proptest;
+mod reduce;
+mod schema;
 mod shrink;
 mod term;
 mod toolchain;
@@ -29,6 +31,7 @@ struct Args {
     demo: bool,
     shape: Shape,
     n_index: Option<usize>,
+    schema_path: Option<PathBuf>,
     guess_header: bool,
     cpp_standard: String,
     cxxflags: Vec<String>,
@@ -51,6 +54,7 @@ impl Default for Args {
             demo: false,
             shape: Shape::Auto,
             n_index: None,
+            schema_path: None,
             guess_header: false,
             cpp_standard: "gnu++20".into(),
             cxxflags: Vec::new(),
@@ -187,11 +191,20 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     };
 
+    let declared = match &args.schema_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read schema {}: {e}", path.display()))?;
+            Some(schema::parse_schema(&text).map_err(|e| format!("{}: {e}", path.display()))?)
+        }
+        None => None,
+    };
     let parsed = model::parse_with(
         &input,
         ParseOptions {
             shape: args.shape,
             n_index: args.n_index,
+            schema: declared,
             guess_header: args.guess_header,
         },
     )?;
@@ -543,6 +556,7 @@ fn parse_args() -> Result<Args, String> {
                     }
                 };
             }
+            "--schema" => a.schema_path = Some(next(&mut i, "--schema")?.into()),
             "--n-index" => {
                 a.n_index = Some(
                     next(&mut i, "--n-index")?
@@ -577,6 +591,17 @@ fn parse_args() -> Result<Args, String> {
     if a.n_index.is_some() && a.shape != Shape::Array {
         return Err("--n-index requires --shape array".into());
     }
+    if a.schema_path.is_some() {
+        // A schema states the grammar outright, so every inference knob is
+        // not merely redundant but contradictory.
+        if a.shape != Shape::Auto {
+            return Err("--schema and --shape are mutually exclusive: a schema already                         states the grammar"
+                .into());
+        }
+        if a.guess_header {
+            return Err("--guess-header has no meaning with --schema: nothing is guessed".into());
+        }
+    }
     if a.checker.is_none() && !a.checker_args.is_empty() {
         return Err("--checker-arg requires --checker".into());
     }
@@ -605,6 +630,7 @@ OPTIONS:
     -n, --iters <N>        stress cases to try     [default: 200]
     -t, --timeout <MS>     per-run timeout         [default: 3000]
     -o, --out <FILE>       where to save the case  [default: minimal.in]
+        --schema <FILE>    read the input against a declared grammar
         --shape <SHAPE>    auto, array, multitest, tree, graph, or raw
                           [default: auto]
         --n-index <INDEX>  length field in an array header (zero-based)
