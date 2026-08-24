@@ -56,6 +56,24 @@ pub enum Model {
     Raw(Vec<Vec<String>>),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shape {
+    #[default]
+    Auto,
+    Array,
+    MultiTest,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParseOptions {
+    pub shape: Shape,
+    pub n_index: Option<usize>,
+    /// In auto mode, accept only the conservative `N + N integers` and standard
+    /// `T` test case forms. Extended headers require an explicit override.
+    pub strict: bool,
+}
+
 impl Model {
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -131,45 +149,102 @@ impl Model {
     }
 }
 
-pub fn parse(text: &str) -> Model {
+pub fn parse_with(text: &str, options: ParseOptions) -> Result<Model, String> {
     let lines: Vec<Vec<String>> = text
         .lines()
         .map(|l| l.split_whitespace().map(str::to_string).collect())
         .collect();
 
     let tokens: Vec<&str> = text.split_whitespace().collect();
+    if options.shape == Shape::Raw {
+        return Ok(Model::Raw(lines));
+    }
     if tokens.is_empty() {
-        return Model::Raw(lines);
+        return match options.shape {
+            Shape::Auto => Ok(Model::Raw(lines)),
+            _ => Err("input is empty and cannot match the requested shape".into()),
+        };
     }
 
     // Every token must be an integer for the structured shapes to apply.
     let ints: Option<Vec<i64>> = tokens.iter().map(|t| t.parse::<i64>().ok()).collect();
     let Some(ints) = ints else {
-        return Model::Raw(lines);
+        return match options.shape {
+            Shape::Auto => Ok(Model::Raw(lines)),
+            _ => Err(format!(
+                "input contains non-integer tokens and cannot match --shape {}",
+                shape_label(options.shape)
+            )),
+        };
     };
+
+    match options.shape {
+        Shape::Raw => unreachable!(),
+        Shape::Array => {
+            let n_idx = options.n_index.unwrap_or(0);
+            return try_explicit_array(&ints, n_idx)
+                .map(Model::Array)
+                .ok_or_else(|| {
+                    format!(
+                        "input does not match --shape array with --n-index {n_idx}: the selected header value must equal the number of data values"
+                    )
+                });
+        }
+        Shape::MultiTest => {
+            if options.n_index.is_some() {
+                return Err("--n-index is currently supported only with --shape array".into());
+            }
+            return try_multitest(&ints).map(Model::MultiTest).ok_or_else(|| {
+                "input does not match --shape multitest (expected T, then T blocks of N + N integers)"
+                    .into()
+            });
+        }
+        Shape::Auto => {}
+    }
 
     // Preferred shape: a bare `N` followed by exactly N values.
     if let Some(c) = try_array(&ints, 1, 0) {
-        return Model::Array(c);
+        return Ok(Model::Array(c));
     }
 
     if let Some(tests) = try_multitest(&ints) {
-        return Model::MultiTest(tests);
+        return Ok(Model::MultiTest(tests));
     }
 
     // Then headers like `N K` / `N M K`, with N in any header position.
-    for h in 1..=3usize {
-        for i in 0..h {
-            if h == 1 && i == 0 {
-                continue; // already tried
-            }
-            if let Some(c) = try_array(&ints, h, i) {
-                return Model::Array(c);
+    if !options.strict {
+        for h in 2..=3usize {
+            for i in 0..h {
+                if let Some(c) = try_array(&ints, h, i) {
+                    return Ok(Model::Array(c));
+                }
             }
         }
     }
 
-    Model::Raw(lines)
+    Ok(Model::Raw(lines))
+}
+
+fn shape_label(shape: Shape) -> &'static str {
+    match shape {
+        Shape::Auto => "auto",
+        Shape::Array => "array",
+        Shape::MultiTest => "multitest",
+        Shape::Raw => "raw",
+    }
+}
+
+fn try_explicit_array(ints: &[i64], n_idx: usize) -> Option<ArrayCase> {
+    let declared = usize::try_from(*ints.get(n_idx)?).ok()?;
+    let header_len = ints.len().checked_sub(declared)?;
+    if header_len == 0 || n_idx >= header_len {
+        return None;
+    }
+    Some(ArrayCase {
+        header: ints[..header_len].to_vec(),
+        n_idx,
+        arr: ints[header_len..].to_vec(),
+    })
 }
 
 fn try_array(ints: &[i64], header_len: usize, n_idx: usize) -> Option<ArrayCase> {
@@ -204,16 +279,17 @@ fn try_multitest(ints: &[i64]) -> Option<Vec<ArrayCase>> {
             return None;
         }
         pos += 1;
-        let n = n as usize;
-        if pos + n > ints.len() {
+        let n = usize::try_from(n).ok()?;
+        let end = pos.checked_add(n)?;
+        if end > ints.len() {
             return None;
         }
         tests.push(ArrayCase {
             header: vec![n as i64],
             n_idx: 0,
-            arr: ints[pos..pos + n].to_vec(),
+            arr: ints[pos..end].to_vec(),
         });
-        pos += n;
+        pos = end;
     }
     if pos == ints.len() {
         Some(tests)
@@ -225,6 +301,10 @@ fn try_multitest(ints: &[i64]) -> Option<Vec<ArrayCase>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(text: &str) -> Model {
+        parse_with(text, ParseOptions::default()).unwrap()
+    }
 
     #[test]
     fn parses_simple_array() {
@@ -277,5 +357,63 @@ mod tests {
         let smaller = c.with_arr(vec![4, -5]);
         assert_eq!(smaller.header[0], 2);
         assert_eq!(Model::Array(smaller).render(), "2\n4 -5\n");
+    }
+
+    #[test]
+    fn strict_mode_rejects_heuristic_extended_header() {
+        let loose = parse("2 99\n1 2\n");
+        assert!(matches!(loose, Model::Array(_)));
+
+        let strict = parse_with(
+            "2 99\n1 2\n",
+            ParseOptions {
+                strict: true,
+                ..ParseOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(strict.is_raw());
+    }
+
+    #[test]
+    fn explicit_shape_and_n_index_override_inference() {
+        let parsed = parse_with(
+            "99 3\n1 2 3\n",
+            ParseOptions {
+                shape: Shape::Array,
+                n_index: Some(1),
+                strict: false,
+            },
+        )
+        .unwrap();
+        let Model::Array(case) = parsed else { panic!() };
+        assert_eq!(case.header, vec![99, 3]);
+        assert_eq!(case.n_idx, 1);
+        assert_eq!(case.arr, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn explicit_raw_never_guesses_a_shape() {
+        let parsed = parse_with(
+            "3\n1 2 3\n",
+            ParseOptions {
+                shape: Shape::Raw,
+                ..ParseOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(parsed.is_raw());
+    }
+
+    #[test]
+    fn explicit_array_reports_mismatch() {
+        let result = parse_with(
+            "4\n1 2 3\n",
+            ParseOptions {
+                shape: Shape::Array,
+                ..ParseOptions::default()
+            },
+        );
+        assert!(result.is_err());
     }
 }

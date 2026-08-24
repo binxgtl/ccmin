@@ -16,10 +16,10 @@ $ ccmin
 [3/3] shrinking...
       size   100 -> 50 -> 25 -> 12 -> 6 -> 3 -> 1
       values avg magnitude 450,715,494 -> 1
-      shrunk in 377ms (16 program runs)
+      shrunk in 377ms (32 total program runs)
 
 ----------------------------------------------------------
-MINIMAL FAILING INPUT
+REDUCED FAILING INPUT
 1
 -1
 ----------------------------------------------------------
@@ -31,7 +31,7 @@ wrote minimal.in
 
 A hundred random values with an average magnitude of 450 million, reduced to a
 single `-1`. The bug is a Kadane implementation that starts `best` at zero and
-therefore allows the empty subarray. You can see that from the minimal input.
+therefore allows the empty subarray. You can see that from the reduced input.
 You could not have seen it from the original.
 
 ## Try it in 30 seconds
@@ -85,6 +85,9 @@ ccmin -s solution.cpp -b slow.cpp -g generator.cpp -n 1000
 -t, --timeout <MS>     per-run timeout         [default: 3000]
 -o, --out <FILE>       where to save the case  [default: minimal.in]
     --no-save          do not write minimal.in
+    --shape <SHAPE>    auto, array, multitest, or raw
+    --n-index <INDEX>  length field in an array header (zero-based)
+    --strict           disable heuristic extended-header detection
     --demo             run the built-in example
     --no-color         disable ANSI colour
 ```
@@ -110,20 +113,39 @@ correct by construction — a desynchronised `N` is unrepresentable. Recognised
 shapes:
 
 - `N` followed by `N` integers, optionally with extra header scalars (`N K`)
-- `T` followed by `T` independent cases of the above
+- `T` followed by `T` independent `N` + `N integers` cases
+
+Auto-detection is convenient but cannot prove a problem's schema. In
+particular, extended headers are inferred when one of their first three values
+happens to equal the remaining token count. `ccmin` warns when it makes this
+heuristic match. Override it when you know the format:
+
+```bash
+ccmin --shape array                 # confirm an array model
+ccmin --shape array --n-index 1     # e.g. K N, with N at index 1
+ccmin --shape multitest             # T blocks of N + N integers
+ccmin --shape raw                   # never update a length field
+ccmin --strict                      # auto-detect only simple N / T forms
+```
 
 Two further guards:
 
 - **Failure kind is preserved.** A shrink that turns a wrong answer into a
   crash is rejected. That is almost always a sign the input drifted out of the
   problem's constraints, and the smaller case would not reproduce the real bug.
+  Both programs are always run: a solution crash or timeout is retained only
+  while the brute force still exits successfully.
 - **Flaky failures are detected.** The counterexample must reproduce three
   times before shrinking starts. Nondeterministic solutions — uninitialised
   memory, `unordered_map` iteration order — otherwise send the shrinker chasing
-  ghosts and yield a minimal case that does not fail when you run it yourself.
+  ghosts and yield a reduced case that does not fail when you run it yourself.
 
 Anything `ccmin` cannot classify still shrinks at the token level, but it says
 so, because in that mode the guarantee above does not hold.
+
+The result is a **small, locally reduced counterexample**, not a proof of the
+globally smallest possible input. Structural delta debugging and bounded value
+shrinking can stop at a local minimum.
 
 ## Windows works without a developer prompt
 
@@ -161,6 +183,11 @@ The `[dependencies]` section of `Cargo.toml` is empty, and stays that way.
 `ccmin` runs compilers and executes binaries on your machine; that is a bad
 place to inherit a supply chain. Everything here is `std`, including the
 Windows console handling and the process timeouts.
+
+Contestant stdout and stderr are each capped at 16 MiB. Exceeding that cap is
+reported as an output-limit failure. `ccmin` is not a sandbox: the compiler,
+generator, solution and brute-force binaries run with your normal user
+permissions, so do not use it for untrusted code.
 
 The only file it writes to your working directory is `minimal.in`, and
 `--no-save` turns that off. Build artifacts go to a temp directory.

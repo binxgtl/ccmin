@@ -40,9 +40,8 @@ impl Compiler {
         }
     }
 
-    fn exe_for(&self, src: &Path, out_dir: &Path) -> PathBuf {
-        let stem = stem_of(src);
-        out_dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
+    fn exe_for(&self, role: &str, out_dir: &Path) -> PathBuf {
+        out_dir.join(format!("ccmin-{role}{}", std::env::consts::EXE_SUFFIX))
     }
 
     /// Compile every source in one go.
@@ -50,15 +49,22 @@ impl Compiler {
     /// This exists rather than a simple `compile()` loop because `vcvars64.bat`
     /// takes several seconds, and paying that once instead of once per file is
     /// the difference between a 5-second and a 15-second first run.
-    pub fn compile_all(&self, srcs: &[PathBuf], out_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    pub fn compile_all(
+        &self,
+        targets: &[(String, PathBuf)],
+        out_dir: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
         match self.kind {
-            Kind::Gnu | Kind::Clang => srcs.iter().map(|s| self.compile_gnu(s, out_dir)).collect(),
-            Kind::Msvc => self.compile_msvc(srcs, out_dir),
+            Kind::Gnu | Kind::Clang => targets
+                .iter()
+                .map(|(role, src)| self.compile_gnu(role, src, out_dir))
+                .collect(),
+            Kind::Msvc => self.compile_msvc(targets, out_dir),
         }
     }
 
-    fn compile_gnu(&self, src: &Path, out_dir: &Path) -> Result<PathBuf, String> {
-        let exe = self.exe_for(src, out_dir);
+    fn compile_gnu(&self, role: &str, src: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+        let exe = self.exe_for(role, out_dir);
         let output = Command::new(&self.path)
             .arg("-std=c++20")
             .arg("-O2")
@@ -78,7 +84,11 @@ impl Compiler {
         Ok(exe)
     }
 
-    fn compile_msvc(&self, srcs: &[PathBuf], out_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    fn compile_msvc(
+        &self,
+        targets: &[(String, PathBuf)],
+        out_dir: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
         // Passing a compound command to `cmd /C` as one argument runs afoul of
         // cmd's quote-stripping rules and silently loses the diagnostics, so we
         // write a batch file instead.
@@ -87,13 +97,13 @@ impl Compiler {
             body.push_str(&format!("call \"{}\" >nul 2>&1\r\n", vcvars.display()));
         }
 
-        let mut exes = Vec::with_capacity(srcs.len());
-        for src in srcs {
-            let exe = self.exe_for(src, out_dir);
+        let mut exes = Vec::with_capacity(targets.len());
+        for (role, src) in targets {
+            let exe = self.exe_for(role, out_dir);
             // Name the object file explicitly. Passing a *directory* would need
             // a trailing backslash, which escapes the closing quote and makes
             // cl parse a mangled path.
-            let obj = out_dir.join(format!("{}.obj", stem_of(src)));
+            let obj = out_dir.join(format!("ccmin-{role}.obj"));
             body.push_str(&format!(
                 "\"{}\" /nologo /std:c++20 /EHsc /O2 \"{}\" /Fe:\"{}\" /Fo:\"{}\"\r\n",
                 self.path.display(),
@@ -123,12 +133,6 @@ impl Compiler {
         }
         Ok(exes)
     }
-}
-
-fn stem_of(src: &Path) -> String {
-    src.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "prog".into())
 }
 
 fn diagnostics(stdout: &[u8], stderr: &[u8], code: Option<i32>) -> String {
@@ -258,4 +262,23 @@ fn which(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_names_are_based_on_role_not_source_stem() {
+        let compiler = Compiler {
+            kind: Kind::Gnu,
+            path: PathBuf::from("g++"),
+            vcvars: None,
+        };
+        let out = Path::new("build");
+        assert_ne!(compiler.exe_for("sol", out), compiler.exe_for("brute", out));
+        assert!(compiler
+            .exe_for("sol", out)
+            .ends_with(format!("ccmin-sol{}", std::env::consts::EXE_SUFFIX)));
+    }
 }

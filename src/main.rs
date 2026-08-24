@@ -8,11 +8,11 @@ mod shrink;
 mod term;
 mod toolchain;
 
-use model::Model;
+use model::{Model, ParseOptions, Shape};
 use oracle::{FailKind, Oracle};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -26,6 +26,9 @@ struct Args {
     save: bool,
     demo: bool,
     no_color: bool,
+    shape: Shape,
+    n_index: Option<usize>,
+    strict: bool,
 }
 
 impl Default for Args {
@@ -40,6 +43,9 @@ impl Default for Args {
             save: true,
             demo: false,
             no_color: false,
+            shape: Shape::Auto,
+            n_index: None,
+            strict: false,
         }
     }
 }
@@ -59,9 +65,9 @@ fn run() -> Result<bool, String> {
     term::init(args.no_color);
 
     // Build artifacts go to a temp directory: ccmin never writes to your
-    // working tree except for the final minimal input.
-    let work = std::env::temp_dir().join(format!("ccmin-{}", std::process::id()));
-    std::fs::create_dir_all(&work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
+    // working tree except for the final reduced input.
+    let work_dir = TempWorkDir::new()?;
+    let work = work_dir.path();
 
     let (sol_src, brute_src, gen_src) = if args.demo {
         println!(
@@ -102,7 +108,14 @@ fn run() -> Result<bool, String> {
     );
     flush();
 
-    let exes = cc.compile_all(&[sol_src, brute_src, gen_src], &work)?;
+    let exes = cc.compile_all(
+        &[
+            ("sol".into(), sol_src),
+            ("brute".into(), brute_src),
+            ("gen".into(), gen_src),
+        ],
+        work,
+    )?;
     let (sol, brute, gen) = (exes[0].clone(), exes[1].clone(), exes[2].clone());
     println!(
         "{}",
@@ -150,7 +163,14 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     };
 
-    let parsed = model::parse(&input);
+    let parsed = model::parse_with(
+        &input,
+        ParseOptions {
+            shape: args.shape,
+            n_index: args.n_index,
+            strict: args.strict,
+        },
+    )?;
     println!(
         "      {} on test #{seed} -- {}",
         term::red("failed"),
@@ -163,16 +183,34 @@ fn run() -> Result<bool, String> {
     );
 
     if parsed.is_raw() {
+        let reason = if args.shape == Shape::Raw {
+            "raw input shape selected; shrinking at token level (result may not satisfy the problem's constraints)"
+        } else {
+            "input shape not recognised; shrinking at token level (result may not satisfy the problem's constraints)"
+        };
+        println!("      {}", term::yellow(&format!("note: {reason}")));
+    } else if args.shape == Shape::Auto
+        && !args.strict
+        && matches!(&parsed, Model::Array(c) if c.header.len() > 1)
+    {
         println!(
             "      {}",
             term::yellow(
-                "note: input shape not recognised; shrinking at token level \
-                 (result may not satisfy the problem's constraints)"
+                "note: array shape was inferred from an extended header; use --shape array to confirm it, --shape raw to disable it, or --strict to reject heuristic matches"
             )
         );
     }
 
     // --- 3. shrink --------------------------------------------------------
+    if failure.kind == FailKind::BothFailed {
+        println!(
+            "\n{} both programs failed on the generated input; the brute force must exit successfully before crash reduction is safe. Shrinking was skipped.",
+            term::yellow("warning:")
+        );
+        report(&input, &failure, &args, None)?;
+        return Ok(true);
+    }
+
     if !oracle.is_stable(&input, failure.kind, 3) {
         println!(
             "\n{} the failure is not reproducible across runs.\n{}",
@@ -193,7 +231,7 @@ fn run() -> Result<bool, String> {
     let before_mag = parsed.avg_magnitude();
 
     let mut chain: Vec<usize> = vec![before_size];
-    let minimal = {
+    let reduced = {
         let mut on_step = |m: &Model| {
             let s = m.size();
             if chain.last() != Some(&s) {
@@ -209,14 +247,21 @@ fn run() -> Result<bool, String> {
     };
     print!("{}", term::clear_line());
 
-    let text = minimal.render();
+    let text = reduced.render();
     let final_failure = oracle
         .judge(&text)
-        .map_err(|e| format!("verifying minimal case: {e}"))?
-        .ok_or_else(|| "internal error: minimal case no longer fails".to_string())?;
+        .map_err(|e| format!("verifying reduced case: {e}"))?
+        .ok_or_else(|| "internal error: reduced case no longer fails".to_string())?;
+    if final_failure.kind != failure.kind {
+        return Err(format!(
+            "internal error: reduced case changed failure kind from {} to {}",
+            failure.kind.describe(),
+            final_failure.kind.describe()
+        ));
+    }
 
     println!("      size   {}", arrow_chain(&chain));
-    let after_mag = minimal.avg_magnitude();
+    let after_mag = reduced.avg_magnitude();
     if before_mag > after_mag {
         println!(
             "      values {}",
@@ -228,14 +273,13 @@ fn run() -> Result<bool, String> {
         );
     }
     println!(
-        "      {} in {:.0}ms ({} program runs)",
+        "      {} in {:.0}ms ({} total program runs)",
         term::green("shrunk"),
         t2.elapsed().as_secs_f64() * 1000.0,
-        oracle.calls
+        oracle.program_runs
     );
 
     report(&text, &final_failure, &args, Some(t2.elapsed()))?;
-    let _ = std::fs::remove_dir_all(&work);
     Ok(true)
 }
 
@@ -246,7 +290,7 @@ fn report(
     _elapsed: Option<Duration>,
 ) -> Result<(), String> {
     println!("\n{}", term::rule());
-    println!("{}", term::bold("MINIMAL FAILING INPUT"));
+    println!("{}", term::bold("REDUCED FAILING INPUT"));
     println!("{}", input.trim_end());
     println!("{}", term::rule());
 
@@ -283,6 +327,12 @@ fn report(
 fn generate(gen: &Path, seed: u32, timeout: Duration) -> Result<String, String> {
     let out = proc::run(gen, &[seed.to_string()], "", timeout)
         .map_err(|e| format!("running generator: {e}"))?;
+    if out.output_limited {
+        return Err(format!(
+            "generator exceeded the {} MiB output limit on seed {seed}",
+            proc::OUTPUT_LIMIT_BYTES / (1024 * 1024)
+        ));
+    }
     if out.timed_out {
         return Err(format!("generator timed out on seed {seed}"));
     }
@@ -345,6 +395,39 @@ fn flush() {
     let _ = std::io::stdout().flush();
 }
 
+struct TempWorkDir {
+    path: PathBuf,
+}
+
+impl TempWorkDir {
+    fn new() -> Result<Self, String> {
+        let base = std::env::temp_dir();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100u8 {
+            let path = base.join(format!("ccmin-{}-{nonce}-{attempt}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot create {}: {e}", path.display())),
+            }
+        }
+        Err("cannot create a unique temporary working directory".into())
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut a = Args::default();
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -369,6 +452,28 @@ fn parse_args() -> Result<Args, String> {
             "--demo" => a.demo = true,
             "--no-color" => a.no_color = true,
             "--no-save" => a.save = false,
+            "--strict" => a.strict = true,
+            "--shape" => {
+                let value = next(&mut i, "--shape")?;
+                a.shape = match value.as_str() {
+                    "auto" => Shape::Auto,
+                    "array" => Shape::Array,
+                    "multitest" | "multi-test" => Shape::MultiTest,
+                    "raw" => Shape::Raw,
+                    _ => {
+                        return Err(format!(
+                            "unknown shape `{value}` (expected auto, array, multitest, or raw)"
+                        ))
+                    }
+                };
+            }
+            "--n-index" => {
+                a.n_index = Some(
+                    next(&mut i, "--n-index")?
+                        .parse()
+                        .map_err(|_| "--n-index wants a zero-based integer")?,
+                );
+            }
             "-s" | "--sol" => a.sol = next(&mut i, "--sol")?.into(),
             "-b" | "--brute" => a.brute = next(&mut i, "--brute")?.into(),
             "-g" | "--gen" => a.gen = next(&mut i, "--gen")?.into(),
@@ -388,14 +493,17 @@ fn parse_args() -> Result<Args, String> {
         }
         i += 1;
     }
+    if a.n_index.is_some() && a.shape != Shape::Array {
+        return Err("--n-index requires --shape array".into());
+    }
     Ok(a)
 }
 
 fn help() -> String {
     format!(
         "ccmin {VERSION}
-Find a failing test for your solution, then shrink it to the smallest input
-that still fails.
+Find a failing test for your solution, then shrink it to a small input that
+still fails.
 
 USAGE:
     ccmin [OPTIONS]
@@ -410,7 +518,10 @@ OPTIONS:
     -n, --iters <N>        stress cases to try     [default: 200]
     -t, --timeout <MS>     per-run timeout         [default: 3000]
     -o, --out <FILE>       where to save the case  [default: minimal.in]
-        --no-save          do not write the minimal input to disk
+        --shape <SHAPE>    auto, array, multitest, or raw [default: auto]
+        --n-index <INDEX>  length field in an array header (zero-based)
+        --strict           disable heuristic extended-header detection
+        --no-save          do not write the reduced input to disk
         --demo             run a built-in worked example
         --no-color         disable ANSI colour
     -h, --help             print this help
