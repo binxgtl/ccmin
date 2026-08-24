@@ -1,11 +1,20 @@
 # Shared dimensions — design note for v0.5
 
-Status: proposal, revision 3. No code written.
+Status: proposal, revision 4. No code written. Design closed — the next step
+is code, starting with benchcases against v0.4 (§10).
 
-Revision 2 separated Count from Axis. Revision 3 resolves the three questions
-that left open: permutations, count-shrink propagation across several axes, and
-where axis independence lives in the model. What each revision got wrong is kept
-in §13 and §14 rather than folded in silently.
+Revision 2 separated Count from Axis. Revision 3 resolved permutations,
+count-shrink propagation and where independence lives. Revision 4 fixes the two
+places revision 3 was still inconsistent with its own model. What each revision
+got wrong is kept in §13, §14 and §15 rather than folded in silently.
+
+Three sentences the implementation has to keep true throughout:
+
+> **A Count never carries identity.
+> An Axis never owns cardinality.
+> A Relation never increases a keep-set.**
+
+Every correction across four revisions has been a violation of one of them.
 
 The model in one line:
 
@@ -162,19 +171,49 @@ An `int` becomes a `Count` only if some axis is bound to it. Otherwise it is a
 
 ---
 
-## 4. The dependency graph has three edge kinds
+## 4. The dependency graph has four edge kinds
 
-Revision 1 had two, having merged the first and third.
+Revision 1 had two, having merged the first and third. Revision 3 added
+`Relation` as a concept (§2, §9) but left this table at three, which was simply
+an inconsistency.
 
 | edge | fires when | effect |
 | --- | --- | --- |
 | **count → collection** | extent changes | every collection on an axis of that count is resized |
 | **axis → reference** | positions removed | `Index` values remapped; records holding dead references dropped |
 | **count → bounds** | extent changes | `Int(DynamicBounds)` values mentioning that count are **clamped** |
+| **axis ↔ relation ↔ axis** | positions removed | a selection on one axis **induces** a selection on another |
 
 The third is what `int K in 1..N` needs and what revision 1 had no mechanism
 for. `N: 10 -> 5` with `K = 8` must clamp `K` to at most 5. That is neither a
 resize nor a remap.
+
+The fourth is distinct from `axis → reference` and must not be folded into it.
+They do different things:
+
+```text
+axis → reference          a target position disappears
+                          -> the HOLDER dies (record dropped)
+
+axis → relation → axis    a selection is made here
+                          -> a selection is INDUCED there
+```
+
+For a bijection the edge is bidirectional (§9). The engine contract:
+
+```text
+Relation::induce(changed_axis, state) -> [(AxisId, KeepMask)]
+Relation::validate(state)             -> bool
+```
+
+with two obligations on every relation:
+
+1. `induced_mask ⊆ current_mask` — a relation may only remove positions;
+2. induction is monotone — the same state never yields a larger mask later.
+
+Given those, §5's finite-descending-lattice argument covers relations with no
+change. Writing the contract this way is also what lets a second relation be
+added without touching the cascade.
 
 ---
 
@@ -202,8 +241,10 @@ apply(axis, mask):
                 keep[a2] &= m2
                 if keep[a2] != before:      # enqueue only on an actual shrink
                     push(a2)
-    for each count c: extent(c) = min |keep[a]| over axes a of c
-    trim any axis of c that still retains more than extent(c)
+    for each count c:
+        extent(c) = min |keep[a]| over axes a of c
+        for each axis a of c: RequireCardinality(a, extent(c))
+            # each axis picks its own positions; no mask crosses axes
     relabel every Index reference through the retained-position mapping
 ```
 
@@ -229,22 +270,40 @@ Shrinking `N` kills edges, so the edge axis goes `10 -> 7` and count `M` becomes
 7. `Foo` must also reach 7 — but *which* three positions does it drop? Nothing
 in the cascade determines that, because nothing constrained `Foo`.
 
-The rule:
+**A count propagates a number, never a mask.**
 
 ```text
 extent(c) = min over axes a of count c of |keep[a]|
-every axis of c with |keep[a]| > extent(c) is trimmed by the canonical rule
+then, for every axis a of c:  RequireCardinality(a, extent(c))
 ```
 
-**Canonical rule: mirror the mask of the axis that drove the shrink.** Every
-axis of a count starts at the same extent — the count was a single number at
-parse time — so mirroring is always well defined. It is deterministic, and it is
-the least damaging choice if the axes turn out to be correlated after all.
-Phase B may explore alternatives later.
+Each axis satisfies that request with **its own** canonical selection. It is
+never handed another axis's mask.
 
-Taking the *minimum* rather than any particular axis keeps the update monotone,
-so the termination argument above survives unchanged: the extra trimming only
-removes positions.
+Revision 3 said the surplus axes should "mirror the mask of the axis that drove
+the shrink". That was wrong, and wrong in the specific way this document exists
+to avoid: distinct `AxisId`s mean *different identity*, so a mask of `{0, 2, 4}`
+on axis A has no meaning applied to axis B. Mirroring quietly restores the
+"position i here corresponds to position i there" assumption that revision 1 was
+corrected for.
+
+It also created a problem it could not answer. If two axes shrink in one cascade
+and both reach the minimum with different masks, which one "drove" it? Answering
+that needs provenance tracking to decide something with no semantic content.
+Propagating only a cardinality makes the question disappear.
+
+If an axis cannot produce a legal keep-set of the requested size — its
+constraints forbid every subset of that cardinality — the candidate is rejected,
+and the cascade may continue to a smaller cardinality. That is a normal
+rejection, not an error.
+
+**The backward-compatible case falls out.** `array A[N]` and `array B[N]` both
+lower to the same default axis of `N` (§9), so they drop the same positions
+because they *are* the same axis — not because a count forced them to. Alignment
+is topology, not propagation.
+
+Taking the *minimum* keeps the update monotone, so the termination argument
+above survives unchanged: the extra trimming only removes positions.
 
 ### Cardinality coupling
 
@@ -254,8 +313,11 @@ main new cost of separating them.
 
 Two-phase reduction:
 
-- **Phase A — cardinality.** ddmin on the count. All its axes drop the same
-  positions. This is the cheap common case and is exactly the v0.4 behaviour.
+- **Phase A — cardinality.** ddmin on the count. Every axis of the count
+  reduces to the chosen size `K` using its own canonical selection. When the
+  declarations share one axis — the default, and every v0.4 schema — they drop
+  the same positions because they are the same axis. This is the cheap common
+  case and reproduces v0.4 exactly.
 - **Phase B — realignment.** At fixed cardinality, let an individually-declared
   independent axis swap *which* positions it keeps. A permutation search, more
   expensive, and only worth running for axes declared independent.
@@ -334,6 +396,14 @@ inputs. Corrected set:
     was implemented as designed.
 12. **Count minimum** — `extent(c) == min |keep[a]|` over the axes of `c`, and
     no axis of `c` retains more positions than that.
+13. **Relations only remove** — for every `induce` result,
+    `induced_mask ⊆ current_mask` of the target axis. This is the testable form
+    of *a Relation never increases a keep-set*, and it is what keeps §5's
+    termination argument valid once relations exist.
+14. **No mask crosses an axis boundary** — a keep-mask is only ever applied to
+    the axis it was computed for. The testable form of *a Count never carries
+    identity*: count propagation passes a cardinality, so any code path handing
+    one axis's mask to another is a bug by construction.
 
 1, 5 and 7 are what the existing harness already covers for the built-in shapes.
 2, 6, 9 and 10 are new and are where I expect the first bugs.
@@ -431,13 +501,47 @@ one.
 
 ### What it forces on the syntax
 
-A permutation introduces *two* axes on one count, which makes a bare
-`array color[N]` ambiguous: position axis, value axis, or a third independent
-axis sharing the count? The model can express all three; v0.4 syntax cannot say
-which. **Axis naming is therefore a syntax requirement, not a nicety** — it
-falls out of the litmus test rather than from wanting a richer language. Some
-form of `array color[P.positions]` / `array weight[P.values]` is needed before
-permutations are usable.
+A permutation introduces *two* axes on one count, so a bare `array color[N]`
+becomes ambiguous: position axis, value axis, or a third independent axis
+sharing the count? The model can express all three; v0.4 syntax cannot say
+which. **Axis naming is a requirement for expressivity**, and it falls out of
+the litmus test rather than from wanting a richer language.
+
+The semantics are settled even though the spelling is not:
+
+- **Every count has a default axis.** A bare `array A[N]` names it. Two bare
+  declarations on the same count therefore land on the *same* axis and stay
+  aligned — not because anything forces them to, but because they are one axis.
+  Every v0.4 schema keeps its current behaviour by construction.
+- **Axes can be declared and named**, and a declaration may index one directly.
+  Two declarations naming different axes of one count are independent; they
+  share cardinality and nothing else.
+- **A permutation exposes two projections**, its domain and its codomain, and a
+  declaration may index either.
+
+Illustrative spelling only — not a syntax proposal:
+
+```text
+int N
+axis points[N]              # a named axis of N
+array X[points]             # parallel: same axis
+array Y[points]
+
+axis aidx[N]                # two axes, one count
+axis bidx[N]
+array A[aidx]               # independent: same size, different identity
+array B[bidx]
+
+permutation P[N]
+array color[P.positions]    # follows the domain
+array weight[P.values]      # follows the codomain
+
+array Legacy[N]             # desugars to N's default axis
+```
+
+What matters is that **independence is expressed by naming a different axis**,
+never by a modifier such as `array A[N] independent`. Independence is not a
+property of an array; it is which axis the array points at (§6).
 
 ---
 
@@ -494,13 +598,27 @@ A second, cheaper one:
 - ~~**Permutations.**~~ Resolved in §9: a bijection between two axes, not an
   element kind. `array A[N] in 1..N` stays a clamped `Int`; `permutation P[N]`
   becomes two axes plus a relation.
-- **Axis naming syntax.** Forced by §9. `array color[N]` is ambiguous once a
-  count carries more than one axis. Needs designing before permutations ship,
-  and it interacts with how independent axes are declared (§2).
-- **Are there relations beyond bijection?** Injection would cover "each query
-  names a distinct element"; a general many-to-one would cover most reference
-  patterns. `Bijection` may be the wrong first abstraction if a weaker one is
-  the common case.
+- ~~**Axis naming syntax.**~~ Semantics settled in §9: default axis per count,
+  named axes for independence, projections for permutations. The *spelling* is
+  still open, but nothing downstream depends on it.
+- ~~**Are there relations beyond bijection?**~~ Resolved: `Bijection` is the
+  right first relation, and the two candidates are not siblings.
+  - *Many-to-one already exists.* `Vector<M_axis, Index(N_axis)>` lets any
+    number of records reference vertex 3; when vertex 3 goes, its holders are
+    dropped. `Index` is many-to-one reference semantics, so a relation for it
+    would be redundant.
+  - *Injection is a collection constraint, not a relation.* "These M queries
+    name distinct vertices" is `AllDistinct(references)`. Shrinking the domain
+    does **not** force the codomain down to the image, because the codomain may
+    legitimately contain unused elements.
+  - *Bijection is genuinely different*: total, injective, surjective and equal
+    in cardinality, which is exactly why selection must propagate **both** ways.
+
+    Keep the engine API abstract (`induce` / `validate`, §4) so a second
+    relation costs no cascade changes, but do not pre-generalise into a
+    `Mapping { injective, surjective, total, .. }` lattice before a real second
+    use case exists. That direction ends in a relation-algebra side project
+    rather than a test-case minimiser.
 - **Can an axis exist with no collection?** `graph ... vertices N` has a vertex
   set with no stored data; its extent is the count itself. Tree and graph
   already behave this way, so probably yes, but it means an axis may have no
@@ -568,3 +686,29 @@ the v0.4 source while checking them.
 All three came from external review. The permutation litmus test in §9 was then
 simulated against the model before being written down, in both the position-to-
 value and value-to-position directions.
+
+---
+
+## 15. What revision 3 got wrong
+
+Both found by external review, and both are the same failure: adding a concept
+and then not propagating it through the rest of the document.
+
+1. **Added `Relation` as a concept but left the dependency graph at three edge
+   kinds.** §9 defines a bijection as inducing selections in both directions,
+   which is plainly a fourth edge. Folding it into `axis → reference` would have
+   been wrong too: a dead reference kills its *holder*, whereas a relation
+   induces a *selection on another axis*. Fixed in §4, with an `induce` /
+   `validate` contract so a second relation does not touch the cascade.
+
+2. **Had a count propagate a mask.** Revision 3 said surplus axes should "mirror
+   the mask of the axis that drove the shrink" — which reinstates the exact
+   assumption revision 1 was corrected for, since distinct axes mean distinct
+   identity and a mask from one has no meaning on another. It also needed
+   provenance tracking to break ties between two axes shrinking at once, in
+   order to decide something with no semantic content. Fixed in §5: a count
+   propagates a cardinality and each axis picks its own positions.
+
+Both were violations of the three sentences at the top of this document, which
+is why they are now stated there. The second in particular is why the summary
+leads with *a Count never carries identity*.
