@@ -8,10 +8,10 @@
 //! always matches the data. See `model.rs` for why that matters.
 
 use crate::model::{ArrayCase, GraphCase, Model};
-use crate::oracle::{FailKind, Oracle};
+use crate::oracle::{FailKind, Judge};
 
 pub struct Shrinker<'a> {
-    oracle: &'a mut Oracle,
+    judge: &'a mut dyn Judge,
     target: FailKind,
     on_step: &'a mut dyn FnMut(&Model),
     error: Option<String>,
@@ -19,12 +19,12 @@ pub struct Shrinker<'a> {
 
 impl<'a> Shrinker<'a> {
     pub fn new(
-        oracle: &'a mut Oracle,
+        judge: &'a mut dyn Judge,
         target: FailKind,
         on_step: &'a mut dyn FnMut(&Model),
     ) -> Self {
         Shrinker {
-            oracle,
+            judge,
             target,
             on_step,
             error: None,
@@ -35,7 +35,7 @@ impl<'a> Shrinker<'a> {
         if self.error.is_some() {
             return false;
         }
-        let ok = match self.oracle.preserves(&m.render(), self.target) {
+        let ok = match self.judge.preserves(&m.render(), self.target) {
             Ok(ok) => ok,
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -359,6 +359,7 @@ fn signed_magnitude(magnitude: u64, negative: bool) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::Oracle;
 
     #[test]
     fn ddmin_finds_single_required_element() {
@@ -405,6 +406,59 @@ mod tests {
     fn graph_ddmin_can_remove_the_final_edge() {
         let out = ddmin_allow_empty(&[42], |_| true);
         assert!(out.is_empty());
+    }
+
+    /// Records every candidate the reducer asks about. Failure condition is
+    /// "some value is negative", which is the shape of the demo's bug.
+    struct Recorder {
+        seen: Vec<String>,
+    }
+
+    impl crate::oracle::Judge for Recorder {
+        fn preserves(&mut self, input: &str, _target: FailKind) -> std::io::Result<bool> {
+            self.seen.push(input.to_string());
+            Ok(input
+                .split_whitespace()
+                .filter_map(|t| t.parse::<i64>().ok())
+                .any(|v| v < 0))
+        }
+    }
+
+    /// The fixpoint loop re-runs both passes until nothing changes, so the last
+    /// round necessarily re-asks questions the previous round already answered.
+    /// That is what `Oracle`'s memo cache exists to absorb; if this ever stops
+    /// holding, the cache is dead weight and should go.
+    #[test]
+    fn the_reducer_re_asks_candidates_so_memoisation_pays() {
+        let mut arr: Vec<i64> = (1..=100).collect();
+        arr[37] = -999_999_999;
+        let model = Model::Array(ArrayCase {
+            header: vec![100],
+            n_idx: 0,
+            arr,
+        });
+
+        let mut recorder = Recorder { seen: Vec::new() };
+        let mut on_step = |_: &Model| {};
+        let mut shrinker = Shrinker::new(&mut recorder, FailKind::WrongAnswer, &mut on_step);
+        let reduced = shrinker.run(&model).unwrap();
+
+        // The reducer still does its job.
+        assert_eq!(
+            reduced,
+            Model::Array(ArrayCase {
+                header: vec![1],
+                n_idx: 0,
+                arr: vec![-1],
+            })
+        );
+
+        let total = recorder.seen.len();
+        let unique: std::collections::HashSet<&String> = recorder.seen.iter().collect();
+        assert!(
+            unique.len() < total,
+            "expected repeated candidates, saw {total} queries all distinct"
+        );
     }
 
     #[test]

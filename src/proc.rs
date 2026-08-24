@@ -13,8 +13,13 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-/// A runaway contestant program must not be able to consume unbounded memory.
-/// The limit applies independently to stdout and stderr.
+/// Cap on how much of a child's output ccmin will buffer, applied independently
+/// to stdout and stderr.
+///
+/// This bounds *our own* memory when a contestant program prints without limit.
+/// It does not constrain what the child allocates: ccmin sets no address-space
+/// or RSS limit, so a program that allocates unboundedly still can. See the
+/// sandboxing note in the README.
 pub const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -7,9 +7,18 @@
 //! would produce a reduced case that does not reproduce the real bug.
 
 use crate::proc::{self, CompareMode, RunOutput};
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Candidates above this size are not memoised. Reduction spends nearly all of
+/// its time on small inputs, and megabyte-sized keys would cost more to hold
+/// than the reruns they save.
+const MAX_CACHED_INPUT_BYTES: usize = 64 * 1024;
+
+/// Bound on cache growth across a long reduction.
+const MAX_CACHE_ENTRIES: usize = 200_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FailKind {
@@ -55,6 +64,13 @@ pub struct CheckerConfig {
     pub scratch_dir: PathBuf,
 }
 
+/// What the reducer needs from the world: a yes/no on whether a candidate still
+/// reproduces the failure. Kept as a trait so invariant tests can drive the
+/// reducer with a pure in-memory predicate instead of spawning processes.
+pub trait Judge {
+    fn preserves(&mut self, input: &str, target: FailKind) -> io::Result<bool>;
+}
+
 pub struct Oracle {
     pub sol: PathBuf,
     pub brute: PathBuf,
@@ -62,6 +78,11 @@ pub struct Oracle {
     pub compare_mode: CompareMode,
     pub checker: Option<CheckerConfig>,
     pub program_runs: usize,
+    pub cache_hits: usize,
+    /// ddmin re-tests identical candidates across granularity restarts and
+    /// value rounds, so memoising verdicts removes real work.
+    cache: HashMap<String, Option<FailKind>>,
+    cache_enabled: bool,
 }
 
 impl Oracle {
@@ -79,6 +100,9 @@ impl Oracle {
             compare_mode,
             checker,
             program_runs: 0,
+            cache_hits: 0,
+            cache: HashMap::new(),
+            cache_enabled: true,
         }
     }
 
@@ -107,19 +131,63 @@ impl Oracle {
         if target == FailKind::BothFailed {
             return Ok(false);
         }
+        if let Some(kind) = self.cached(input) {
+            self.cache_hits += 1;
+            return Ok(kind == Some(target));
+        }
+        let kind = self.judge(input)?.map(|f| f.kind);
+        self.remember(input, kind);
+        Ok(kind == Some(target))
+    }
+
+    fn preserves_uncached(&mut self, input: &str, target: FailKind) -> io::Result<bool> {
+        if target == FailKind::BothFailed {
+            return Ok(false);
+        }
         Ok(matches!(self.judge(input)?, Some(f) if f.kind == target))
     }
 
     /// Guard against flaky solutions (uninitialised memory, hash iteration
     /// order). Shrinking a nondeterministic failure chases ghosts for minutes
     /// and yields a reduced case that does not reproduce.
+    ///
+    /// Deliberately bypasses the cache. Reading back a memoised verdict would
+    /// answer with the first run's result and defeat the entire check.
     pub fn is_stable(&mut self, input: &str, target: FailKind, tries: usize) -> io::Result<bool> {
         for _ in 0..tries {
-            if !self.preserves(input, target)? {
+            if !self.preserves_uncached(input, target)? {
+                // A program that disagrees with itself makes every memoised
+                // verdict suspect, not only this one.
+                self.cache_enabled = false;
+                self.cache.clear();
                 return Ok(false);
             }
         }
+        self.remember(input, Some(target));
         Ok(true)
+    }
+
+    fn cached(&self, input: &str) -> Option<Option<FailKind>> {
+        if !self.cache_enabled {
+            return None;
+        }
+        self.cache.get(input).copied()
+    }
+
+    fn remember(&mut self, input: &str, kind: Option<FailKind>) {
+        if !self.cache_enabled
+            || input.len() > MAX_CACHED_INPUT_BYTES
+            || self.cache.len() >= MAX_CACHE_ENTRIES
+        {
+            return;
+        }
+        self.cache.insert(input.to_string(), kind);
+    }
+}
+
+impl Judge for Oracle {
+    fn preserves(&mut self, input: &str, target: FailKind) -> io::Result<bool> {
+        Oracle::preserves(self, input, target)
     }
 }
 
@@ -313,6 +381,73 @@ mod tests {
             timed_out: false,
             output_limited: false,
         }
+    }
+
+    /// Both paths point at nothing, so any real execution fails loudly. That
+    /// makes "did this actually run a program?" observable in a unit test.
+    fn unrunnable_oracle() -> Oracle {
+        let missing = PathBuf::from("__ccmin_definitely_missing_executable__");
+        Oracle::new(
+            missing.clone(),
+            missing,
+            Duration::from_millis(10),
+            CompareMode::Exact,
+            None,
+        )
+    }
+
+    #[test]
+    fn preserves_answers_from_the_cache_without_running_programs() {
+        let mut oracle = unrunnable_oracle();
+        oracle.remember("1\n-1\n", Some(FailKind::WrongAnswer));
+
+        assert!(oracle.preserves("1\n-1\n", FailKind::WrongAnswer).unwrap());
+        assert_eq!(
+            oracle.program_runs, 0,
+            "a cache hit must not spawn anything"
+        );
+        assert_eq!(oracle.cache_hits, 1);
+
+        // A memoised non-failure is just as usable as a memoised failure.
+        oracle.remember("2\n1 1\n", None);
+        assert!(!oracle.preserves("2\n1 1\n", FailKind::WrongAnswer).unwrap());
+        assert_eq!(oracle.program_runs, 0);
+    }
+
+    #[test]
+    fn is_stable_bypasses_the_cache() {
+        let mut oracle = unrunnable_oracle();
+        oracle.remember("1\n-1\n", Some(FailKind::WrongAnswer));
+
+        // Reading the memoised verdict back would report the first run's answer
+        // three times and defeat the flakiness check entirely, so this must
+        // actually try to execute -- and fail, because the binaries do not exist.
+        assert!(oracle
+            .is_stable("1\n-1\n", FailKind::WrongAnswer, 3)
+            .is_err());
+    }
+
+    #[test]
+    fn oversized_candidates_are_not_memoised() {
+        let mut oracle = unrunnable_oracle();
+        let big = "9 ".repeat(MAX_CACHED_INPUT_BYTES);
+        oracle.remember(&big, Some(FailKind::WrongAnswer));
+        assert!(oracle.cached(&big).is_none());
+    }
+
+    #[test]
+    fn a_disabled_cache_forgets_everything_it_knew() {
+        let mut oracle = unrunnable_oracle();
+        oracle.remember("1\n-1\n", Some(FailKind::WrongAnswer));
+        assert!(oracle.cached("1\n-1\n").is_some());
+
+        oracle.cache_enabled = false;
+        oracle.cache.clear();
+
+        assert!(oracle.cached("1\n-1\n").is_none());
+        // And it stays off: later verdicts are not memoised either.
+        oracle.remember("1\n-1\n", Some(FailKind::WrongAnswer));
+        assert!(oracle.cached("1\n-1\n").is_none());
     }
 
     #[test]

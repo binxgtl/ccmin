@@ -4,6 +4,8 @@ mod demo;
 mod model;
 mod oracle;
 mod proc;
+#[cfg(test)]
+mod proptest;
 mod shrink;
 mod term;
 mod toolchain;
@@ -309,8 +311,13 @@ fn run() -> Result<bool, String> {
             ))
         );
     }
+    let saved = if oracle.cache_hits > 0 {
+        format!(", {} repeats served from cache", oracle.cache_hits)
+    } else {
+        String::new()
+    };
     println!(
-        "      {} in {:.0}ms ({} total program runs)",
+        "      {} in {:.0}ms ({} total program runs{saved})",
         term::green("shrunk"),
         t2.elapsed().as_secs_f64() * 1000.0,
         oracle.program_runs
