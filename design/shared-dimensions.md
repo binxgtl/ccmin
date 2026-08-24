@@ -1,23 +1,24 @@
 # Shared dimensions — design note for v0.5
 
-Status: proposal, revision 5. **Design closed.** The next step is code:
-benchcases freezing v0.4 (§10).
+Status: proposal, revision 6. Implementation under way (v0.5 step 1).
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
 count-shrink propagation and where independence lives. Revision 4 fixed two
-places revision 3 contradicted its own model. Revision 5 closes the cascade
-fixpoint over cardinality events — a scheduling bug, not an architectural one.
-What each revision got wrong is kept in §13 to §16 rather than folded in
-silently.
+places revision 3 contradicted its own model. Revision 5 closed the cascade
+fixpoint over cardinality events. Revision 6 separates the static arena from
+runtime state, after checkpoint 3 of the implementation ran into it. What each
+revision got wrong is kept in §13 to §17 rather than folded in silently.
 
-Three sentences the implementation has to keep true throughout:
+Four sentences the implementation has to keep true throughout:
 
 > **A Count never carries identity.
 > An Axis never owns cardinality.
-> A Relation never increases a keep-set.**
+> A Relation never increases a keep-set.
+> An arena node never holds instance state.**
 
-Every architectural correction across five revisions has been a violation of
-one of them.
+Every architectural correction across six revisions has been a violation of one
+of them. The fourth was added by revision 6 and is the first one found by
+writing code rather than by reading the document.
 
 The model in one line:
 
@@ -123,20 +124,58 @@ opt-in buys reachability where the arrays really are unrelated.
 
 ## 3. Representation
 
+### The arena is static; extents and masks are not
+
+A schema is a set of *declarations*. An input is a set of *instantiations* of
+them. Those are different populations, and the difference is not cosmetic:
+
+```text
+int T in 1..10
+repeat T {
+  int N in 1..10
+  array A[N] in -1000..1000
+}
+```
+
+`N` is one declaration. With `T = 3` it has three live instances, and they hold
+different values — `2`, `3`, `1` in the corpus case. A `CountId` names the
+declaration. It cannot name the value, because there are three of them.
+
+Earlier revisions put `extent` on `Count` and `keep` on `Axis`. Both are
+runtime state living on an arena node, which silently collapses
+`(declaration, instance)` down to `declaration`. Everything at the top level of
+a schema works, because there each declaration has exactly one instance; the
+moment a declaration sits inside a `repeat` body it is wrong.
+
+So:
+
+- **The arena holds only what a schema knows before any input exists**: names,
+  bounds, constraints, and the axis topology.
+- **Cardinality lives in the instantiated data**, in the `Value::Int` slot the
+  count renders to. There is no parallel extent table; one source of truth.
+- **A keep-mask lives with the instantiated data whose dimension it describes**,
+  for the same reason.
+
+The invariant is therefore not "a Count owns cardinality" but the sharper:
+
+> **Each instantiated count slot owns its cardinality. A `CountId` identifies
+> the declaration, and thereby the topological role of that slot.**
+
 ```rust
 type CountId = usize;
 type AxisId  = usize;
 
+// ---- static: the arena, fixed once the schema parses --------------------
+
 struct Count {
     name: String,        // the declared int; rendered to the file
     bounds: Bounds,      // 1..100
-    extent: usize,       // authoritative
+    axis: AxisId,        // its default axis
 }
 
 struct Axis {
-    count: CountId,                        // cardinality comes from here
+    count: CountId,                         // where cardinality comes from
     constraints: Vec<SelectionConstraint>,  // see §6
-    keep: Vec<usize>,                      // current positions, into the original
 }
 
 struct Schema {
@@ -144,6 +183,16 @@ struct Schema {
     axes: Vec<Axis>,
     items: Vec<Decl>,
 }
+
+// ---- dynamic: per instantiation, alongside the data ---------------------
+//
+//   cardinality  the Value::Int slot a CountId locates in this instantiation
+//   keep-mask    held by the data whose dimension the axis occurrence is
+//
+// Deliberately not given a representation here. `keep[(AxisId, instance)]` is
+// the shape of the state, but committing to a tuple key would be inventing a
+// runtime instance-addressing abstraction before anything has shown one is
+// needed.
 
 enum Decl {
     Scalar { name: String, ty: Scalar },
@@ -243,12 +292,21 @@ axis B shrinks to meet a cardinality
   -> ...
 ```
 
-Two event kinds, both monotone:
+Two event kinds, both monotone.
+
+The state is per **axis occurrence**, not per `AxisId`: a declaration inside a
+`repeat` body has one occurrence per iteration, each with its own mask, and
+they shrink independently (§3). Written below as `keep[axis]` for readability,
+where `axis` means the occurrence. The lattice argument is unaffected — the
+product is over occurrences rather than over static identifiers, and it is
+still finite.
 
 ```text
 state:
     keep[axis]    bitmask over original positions   -- only ever &=
-    target[count] upper bound on extent             -- only ever decreases
+                  one per axis OCCURRENCE, not per AxisId
+    target[count] upper bound on cardinality        -- only ever decreases
+                  likewise per count occurrence
 
 apply(axis, mask):
     push RestrictAxis(axis, mask)
@@ -272,7 +330,7 @@ apply(axis, mask):
                                                     # a picks its OWN positions
 
     # only once the queue is empty
-    for each count c: extent(c) = target[c]
+    for each count occurrence c: write target[c] into c's own Value::Int slot
     relabel every Index reference through its own axis's retained mapping
     validate every relation and constraint
 ```
@@ -405,9 +463,12 @@ rather than silently accepted.
 Revision 1's compaction invariant was wrong and would have failed correct
 inputs. Corrected set:
 
-1. **Cardinality agreement** — for every collection on axis `a`,
-   `len(c) == extent(count(a))`. Per-axis for grids. Should be structurally
-   unrepresentable, not merely checked.
+0. **The arena holds no instance state** — no `Count` or `Axis` node carries
+   an extent or a mask. Structural, and the reason the rest of this list is
+   phrased per occurrence.
+1. **Cardinality agreement** — for every collection on axis occurrence `a`,
+   `len(c)` equals the cardinality in the count slot `a` resolves to in *that*
+   instantiation. Per-axis for grids.
 2. **Cardinality coupling** — all axes sharing a count have equal-size keep sets.
 3. **Count bounds** — `bounds(c).lo <= extent(c) <= bounds(c).hi`.
 4. **Reference range** — every `Index(a)` value lies in `1..=extent(count(a))`.
@@ -428,8 +489,9 @@ inputs. Corrected set:
     to `keep[a]` is a bijection onto `keep[b]`. Follows by construction when the
     cascade uses image and preimage (§9), so this is a check that the cascade
     was implemented as designed.
-12. **Count minimum** — `extent(c) == min |keep[a]|` over the axes of `c`, and
-    no axis of `c` retains more positions than that.
+12. **Count minimum** — a count occurrence's cardinality is
+    `min |keep[a]|` over its own axis occurrences, and none of them retains
+    more positions than that.
 13. **Relations only remove** — for every `induce` result,
     `induced_mask ⊆ current_mask` of the target axis. This is the testable form
     of *a Relation never increases a keep-set*, and it is what keeps §5's
@@ -438,9 +500,15 @@ inputs. Corrected set:
     the axis it was computed for. The testable form of *a Count never carries
     identity*: count propagation passes a cardinality, so any code path handing
     one axis's mask to another is a bug by construction.
+15. **Instances are independent** — one occurrence of a count declared inside a
+    `repeat` body may differ from another, and editing one iteration must
+    neither overwrite nor reinterpret another iteration's slot. The testable
+    form of *an arena node never holds instance state*, and the exact case that
+    caught revision 5.
 
 1, 5 and 7 are what the existing harness already covers for the built-in shapes.
-2, 6, 9 and 10 are new and are where I expect the first bugs.
+2, 6, 9 and 10 are new and are where I expect the first bugs. 0 and 15 are the
+pair that revision 6 added; 15 lands as a regression test in checkpoint 3.
 
 ---
 
@@ -769,3 +837,52 @@ Worth noting for the implementation: this class of bug does not show up in a
 model review, only in reading the pseudocode as an operational semantics. The
 same is likely true of whatever is still wrong here, which is the argument for
 stopping the design and writing benchcases.
+
+---
+
+## 17. What revision 5 got wrong
+
+One thing, and it is the first error in this document found by writing code
+rather than by reading it.
+
+**`extent` was a field on `Count`, and `keep` a field on `Axis`.** Both are
+runtime state on an arena node. A `CountId` names a *declaration*; a
+declaration inside a `repeat` body has one instance per iteration, each with its
+own value. Putting the value on the node collapses `(declaration, instance)` to
+`declaration`, and the collapse is invisible for any schema whose declarations
+are all top level — which is every example in revisions 1 through 5.
+
+Caught by checkpoint 3 of the implementation, immediately, on the corpus case
+`repeat_iteration_delete`:
+
+```text
+int T in 1..10
+repeat T {
+  int N in 1..10
+  array A[N] in -1000..1000
+}
+```
+
+with `T = 3` and `N` taking `2`, `3`, `1`. A flat `extents[CountId]` table held
+only the last write, and a consistency assertion comparing the table against the
+declared slots failed on the first candidate:
+
+```text
+initial: count N is 1 in the table but 2 in the slot
+```
+
+Fixed in §3 by separating the static arena from instantiated state, and in §5 by
+making the cascade state per axis occurrence rather than per `AxisId`. The
+sharper invariant that replaces "a Count owns cardinality" is in §3.
+
+Two notes on process, since this is the fifth architectural correction:
+
+The failure was not reachable by review. Every earlier correction came from
+reading the model; this one required an implementation and a corpus case with a
+nested declaration. §16 predicted exactly that, and the prediction cost one
+reverted checkpoint to confirm.
+
+The reduced checkpoint 3 that follows does *not* introduce instance frames.
+Nothing in this failure shows that a runtime instance-addressing abstraction is
+required — only that cardinality must not be duplicated. Building frames now
+would fold two independently verifiable decisions into one change.
