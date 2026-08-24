@@ -133,17 +133,110 @@ impl Decl {
     }
 }
 
+// ---- counts and axes -----------------------------------------------------
+//
+// Migration scaffolding for v0.5 (design/shared-dimensions.md). The eventual
+// model separates three things v0.4 keeps as one: a Count owns cardinality, an
+// Axis owns positional identity, and a Reference names a position on an axis.
+//
+// This checkpoint introduces the identifiers and their storage only. Nothing
+// reads them to make a decision yet; the old `derived` set still drives every
+// behaviour, and a test asserts the two descriptions agree. Keeping both paths
+// alive means a benchcase that moves later can be blamed on one of them.
+
+pub type CountId = usize;
+pub type AxisId = usize;
+
+/// An `int` that some declaration is sized by. Cardinality lives here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Count {
+    pub name: String,
+    pub bounds: Bounds,
+    /// Every count has exactly one axis for now. Several axes per count is
+    /// what makes shared dimensions possible, and is not this step.
+    pub axis: AxisId,
+}
+
+/// A set of positions with identity. Cardinality is *not* stored here; it
+/// comes from the count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Axis {
+    pub count: CountId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
     pub items: Vec<Decl>,
     /// Names bound to a count or vertex total. These are recomputed from the
     /// data rather than shrunk on their own.
+    ///
+    /// Still authoritative. `counts` describes the same set and is checked
+    /// against it, but does not yet drive anything.
     derived: HashSet<String>,
+    counts: Vec<Count>,
+    axes: Vec<Axis>,
+    count_by_name: HashMap<String, CountId>,
 }
 
 impl Schema {
     pub fn is_derived(&self, name: &str) -> bool {
         self.derived.contains(name)
+    }
+}
+
+// Read by the migration tests now, and by the reducer at the next checkpoint
+// when declarations start resolving through axes instead of names. The allow
+// is scoped to this block so it disappears with the scaffolding.
+#[allow(dead_code)]
+impl Schema {
+    pub fn count_id(&self, name: &str) -> Option<CountId> {
+        self.count_by_name.get(name).copied()
+    }
+
+    pub fn count(&self, id: CountId) -> &Count {
+        &self.counts[id]
+    }
+
+    pub fn count_ids(&self) -> std::ops::Range<CountId> {
+        0..self.counts.len()
+    }
+
+    /// The single axis of a count. Plural axes per count arrive with shared
+    /// dimensions; until then this is total.
+    pub fn default_axis(&self, id: CountId) -> AxisId {
+        self.counts[id].axis
+    }
+
+    pub fn axis(&self, id: AxisId) -> &Axis {
+        &self.axes[id]
+    }
+}
+
+/// Allocate one count per derived `int`, and one axis per count, in
+/// declaration order so the identifiers are stable.
+fn build_arenas(
+    items: &[Decl],
+    derived: &HashSet<String>,
+    counts: &mut Vec<Count>,
+    axes: &mut Vec<Axis>,
+    by_name: &mut HashMap<String, CountId>,
+) {
+    for decl in items {
+        match decl {
+            Decl::Int { name, bounds } if derived.contains(name) => {
+                let count = counts.len();
+                let axis = axes.len();
+                counts.push(Count {
+                    name: name.clone(),
+                    bounds: *bounds,
+                    axis,
+                });
+                axes.push(Axis { count });
+                by_name.insert(name.clone(), count);
+            }
+            Decl::Repeat { body, .. } => build_arenas(body, derived, counts, axes, by_name),
+            _ => {}
+        }
     }
 }
 
@@ -171,7 +264,19 @@ pub fn parse_schema(text: &str) -> Result<Rc<Schema>, String> {
     let mut derived = HashSet::new();
     let mut all_names = HashSet::new();
     validate(&items, &mut derived, &mut all_names)?;
-    Ok(Rc::new(Schema { items, derived }))
+
+    let mut counts = Vec::new();
+    let mut axes = Vec::new();
+    let mut count_by_name = HashMap::new();
+    build_arenas(&items, &derived, &mut counts, &mut axes, &mut count_by_name);
+
+    Ok(Rc::new(Schema {
+        items,
+        derived,
+        counts,
+        axes,
+        count_by_name,
+    }))
 }
 
 /// Splits on whitespace but also makes brackets and braces their own tokens, so
@@ -1388,6 +1493,92 @@ mod tests {
             let err = parse_schema(text).unwrap_err();
             assert!(err.contains(needle), "{text:?} gave {err:?}");
         }
+    }
+
+    /// Schemas covering every declaration kind, reused by the migration tests.
+    fn sample_schemas() -> Vec<&'static str> {
+        vec![
+            "int N in 1..100\narray A[N] in 1..1000\n",
+            "int R in 1..50\nint C in 1..50\nmatrix G[R][C] in 0..1\n",
+            "int T in 1..10\nrepeat T {\n  int N in 1..10\n  array A[N] in -1000..1000\n}\n",
+            "int N in 2..100\ntree E vertices N\n",
+            "int N in 1..100\nint M in 0..1000\ngraph E[M] vertices N\n",
+            "int K in 0..100\nint T in 1..10\nrepeat T {\n  int N in 1..10\n  \
+             array A[N] in -1000..1000\n}\n",
+            "array A[3] in 0..9\n",
+        ]
+    }
+
+    fn int_names(items: &[Decl], out: &mut Vec<String>) {
+        for decl in items {
+            match decl {
+                Decl::Int { name, .. } => out.push(name.clone()),
+                Decl::Repeat { body, .. } => int_names(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Migration invariant. The count arena and the `derived` set must describe
+    /// exactly the same thing while both exist. When `derived` is finally
+    /// deleted this test goes with it.
+    #[test]
+    fn the_count_arena_agrees_with_the_derived_set() {
+        for text in sample_schemas() {
+            let schema = parse_schema(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+
+            let mut names = Vec::new();
+            int_names(&schema.items, &mut names);
+            for name in &names {
+                assert_eq!(
+                    schema.is_derived(name),
+                    schema.count_id(name).is_some(),
+                    "{text:?}: `{name}` disagrees between the two descriptions"
+                );
+            }
+
+            let derived_count = names.iter().filter(|n| schema.is_derived(n)).count();
+            assert_eq!(
+                derived_count,
+                schema.count_ids().len(),
+                "{text:?}: wrong number of counts"
+            );
+        }
+    }
+
+    /// One axis per count, pointing back at it. Several axes per count is what
+    /// shared dimensions add later; this pins the current arity so that change
+    /// is visible when it happens.
+    #[test]
+    fn every_count_has_exactly_one_axis_pointing_back() {
+        for text in sample_schemas() {
+            let schema = parse_schema(text).unwrap();
+            assert_eq!(schema.axes.len(), schema.counts.len(), "{text:?}");
+            for id in schema.count_ids() {
+                let axis = schema.default_axis(id);
+                assert_eq!(
+                    schema.axis(axis).count,
+                    id,
+                    "{text:?}: axis {axis} does not point back at count {id}"
+                );
+                assert_eq!(schema.count_id(&schema.count(id).name), Some(id));
+            }
+        }
+    }
+
+    /// Identifiers are allocated in declaration order, including inside a
+    /// repeat body, so they are stable across runs and reviewable in a diff.
+    #[test]
+    fn count_ids_follow_declaration_order() {
+        let schema = parse_schema(
+            "int K in 0..100\nint T in 1..10\nrepeat T {\n  int N in 1..10\n  \
+             array A[N] in -1000..1000\n}\n",
+        )
+        .unwrap();
+        // K is not used as a count, so it gets none. T then N, outer first.
+        assert_eq!(schema.count_id("K"), None);
+        assert_eq!(schema.count_id("T"), Some(0));
+        assert_eq!(schema.count_id("N"), Some(1));
     }
 
     #[test]
