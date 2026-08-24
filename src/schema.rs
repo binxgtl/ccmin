@@ -210,6 +210,29 @@ impl Schema {
     pub fn axis(&self, id: AxisId) -> &Axis {
         &self.axes[id]
     }
+
+    /// The axis that sizes this reference, or `None` when the count is a
+    /// literal and the size is therefore fixed by the schema.
+    pub fn sizing_axis(&self, r: &Ref) -> Option<AxisId> {
+        match r {
+            Ref::Lit(_) => None,
+            // Names are unique across the schema and validation already
+            // required a count to be declared in the block it sizes, so a
+            // global lookup here cannot resolve to the wrong one.
+            Ref::Name(n) => self.count_id(n).map(|id| self.default_axis(id)),
+        }
+    }
+
+    /// Cardinality bounds reach an axis through its count. An axis never owns
+    /// them.
+    pub fn axis_bounds(&self, axis: AxisId) -> Bounds {
+        self.counts[self.axes[axis].count].bounds
+    }
+
+    /// What the reducer asks: how far may whatever sizes this reference shrink?
+    pub fn sizing_bounds(&self, r: &Ref) -> Option<Bounds> {
+        self.sizing_axis(r).map(|axis| self.axis_bounds(axis))
+    }
 }
 
 /// Allocate one count per derived `int`, and one axis per count, in
@@ -569,9 +592,12 @@ fn validate(
     Ok(())
 }
 
-/// Bounds of the int a count refers to, or `None` when the count is a literal
-/// (in which case the size is fixed and must not be reduced at all).
-fn count_bounds(items: &[Decl], r: &Ref) -> Option<Bounds> {
+/// The pre-arena lookup: scan the enclosing block for an `int` of that name.
+///
+/// Superseded by `Schema::sizing_bounds`, and kept only so a test can assert
+/// the two agree. Deleted once the arena is the sole path.
+#[cfg(test)]
+fn count_bounds_by_scan(items: &[Decl], r: &Ref) -> Option<Bounds> {
     match r {
         Ref::Lit(_) => None,
         Ref::Name(n) => items.iter().find_map(|d| match d {
@@ -1013,17 +1039,6 @@ fn decl_at<'a>(items: &'a [Decl], path: &[usize]) -> Option<&'a Decl> {
     decl_at(body, &path[2..])
 }
 
-/// The block a path's declaration lives in, needed to resolve its count fields.
-fn block_at<'a>(items: &'a [Decl], path: &[usize]) -> Option<&'a [Decl]> {
-    if path.len() == 1 {
-        return Some(items);
-    }
-    let Decl::Repeat { body, .. } = items.get(*path.first()?)? else {
-        return None;
-    };
-    block_at(body, &path[2..])
-}
-
 fn sites(items: &[Decl], values: &[Value], prefix: &mut Path, out: &mut Vec<Path>) {
     for (i, (decl, value)) in items.iter().zip(values).enumerate() {
         prefix.push(i);
@@ -1142,8 +1157,7 @@ fn shrink_site(
     accept: &mut dyn FnMut(&SchemaData) -> bool,
 ) -> bool {
     let schema = Rc::clone(&data.schema);
-    let (Some(decl), Some(block)) = (decl_at(&schema.items, path), block_at(&schema.items, path))
-    else {
+    let Some(decl) = decl_at(&schema.items, path) else {
         return false;
     };
     let Some(value) = value_at(&data.values, path).cloned() else {
@@ -1153,7 +1167,7 @@ fn shrink_site(
     match (decl, value) {
         (Decl::Array { len, .. }, Value::Array(arr)) => {
             // A literal length is fixed by the schema and must not move.
-            let Some(bounds) = count_bounds(block, len) else {
+            let Some(bounds) = schema.sizing_bounds(len) else {
                 return false;
             };
             let min = bounds.min_count();
@@ -1168,7 +1182,7 @@ fn shrink_site(
         }
 
         (Decl::Matrix { rows, cols, .. }, Value::Matrix(grid)) => {
-            if let Some(bounds) = count_bounds(block, rows) {
+            if let Some(bounds) = schema.sizing_bounds(rows) {
                 let min = bounds.min_count();
                 if grid.len() > min {
                     let reduced = ddmin_floor(&grid, min, |cand| {
@@ -1179,7 +1193,7 @@ fn shrink_site(
                     }
                 }
             }
-            if let Some(bounds) = count_bounds(block, cols) {
+            if let Some(bounds) = schema.sizing_bounds(cols) {
                 let min = bounds.min_count();
                 let width = grid.first().map_or(0, |r| r.len());
                 if width > min {
@@ -1202,7 +1216,7 @@ fn shrink_site(
         }
 
         (Decl::Graph { edges, verts, .. }, Value::Graph(graph)) => {
-            if let Some(bounds) = count_bounds(block, edges) {
+            if let Some(bounds) = schema.sizing_bounds(edges) {
                 let min = bounds.min_count();
                 if graph.edges.len() > min {
                     let reduced = ddmin_floor(&graph.edges, min, |cand| {
@@ -1219,7 +1233,7 @@ fn shrink_site(
                     }
                 }
             }
-            if let Some(bounds) = count_bounds(block, verts) {
+            if let Some(bounds) = schema.sizing_bounds(verts) {
                 let min = bounds.min_count().max(1);
                 if graph.n > min {
                     let vertices: Vec<usize> = (1..=graph.n).collect();
@@ -1235,7 +1249,7 @@ fn shrink_site(
         }
 
         (Decl::Tree { verts, .. }, Value::Graph(tree)) => {
-            let Some(bounds) = count_bounds(block, verts) else {
+            let Some(bounds) = schema.sizing_bounds(verts) else {
                 return false;
             };
             let min = bounds.min_count().max(1);
@@ -1274,7 +1288,7 @@ fn shrink_site(
         }
 
         (Decl::Repeat { count, .. }, Value::Repeat(iters)) => {
-            let Some(bounds) = count_bounds(block, count) else {
+            let Some(bounds) = schema.sizing_bounds(count) else {
                 return false;
             };
             let min = bounds.min_count();
@@ -1579,6 +1593,85 @@ mod tests {
         assert_eq!(schema.count_id("K"), None);
         assert_eq!(schema.count_id("T"), Some(0));
         assert_eq!(schema.count_id("N"), Some(1));
+    }
+
+    /// Every (enclosing block, declaration) pair, without needing any data.
+    fn walk_decls<'a>(items: &'a [Decl], out: &mut Vec<(&'a [Decl], &'a Decl)>) {
+        for decl in items {
+            out.push((items, decl));
+            if let Decl::Repeat { body, .. } = decl {
+                walk_decls(body, out);
+            }
+        }
+    }
+
+    fn sizing_refs(decl: &Decl) -> Vec<&Ref> {
+        match decl {
+            Decl::Int { .. } => vec![],
+            Decl::Array { len, .. } => vec![len],
+            Decl::Matrix { rows, cols, .. } => vec![rows, cols],
+            Decl::Tree { verts, .. } => vec![verts],
+            Decl::Graph { edges, verts, .. } => vec![edges, verts],
+            Decl::Repeat { count, .. } => vec![count],
+        }
+    }
+
+    /// Migration invariant. Resolving a size through the axis arena must give
+    /// exactly what scanning the enclosing block gave, for every sizing
+    /// position in every declaration kind — including inside a repeat body,
+    /// where the block-local scan was the whole reason that helper existed.
+    #[test]
+    fn arena_lookup_matches_the_old_block_scan() {
+        let mut checked = 0usize;
+        for text in sample_schemas() {
+            let schema = parse_schema(text).unwrap();
+            let mut pairs = Vec::new();
+            walk_decls(&schema.items, &mut pairs);
+            for (block, decl) in pairs {
+                for r in sizing_refs(decl) {
+                    checked += 1;
+                    assert_eq!(
+                        count_bounds_by_scan(block, r),
+                        schema.sizing_bounds(r),
+                        "{text:?}: {r:?} resolves differently"
+                    );
+                }
+            }
+        }
+        assert!(checked >= 10, "only {checked} sizing positions exercised");
+    }
+
+    /// A literal size is fixed by the schema, so it has no axis and the
+    /// reducer must leave its length alone.
+    #[test]
+    fn a_literal_size_has_no_axis() {
+        let schema = parse_schema(
+            "array A[3] in 0..9
+",
+        )
+        .unwrap();
+        assert_eq!(schema.sizing_axis(&Ref::Lit(3)), None);
+        assert_eq!(schema.sizing_bounds(&Ref::Lit(3)), None);
+    }
+
+    /// v0.4 alignment comes from topology: both declarations resolve to the
+    /// same axis, rather than being kept in step by a repair pass.
+    #[test]
+    fn declarations_on_one_count_share_its_single_axis() {
+        let schema = parse_schema(
+            "int T in 1..10
+repeat T {
+  int N in 1..10
+  array A[N]
+}
+",
+        )
+        .unwrap();
+        let t_axis = schema.sizing_axis(&Ref::Name("T".into())).unwrap();
+        let n_axis = schema.sizing_axis(&Ref::Name("N".into())).unwrap();
+        assert_ne!(t_axis, n_axis, "different counts must not share an axis");
+        assert_eq!(schema.axis(t_axis).count, schema.count_id("T").unwrap());
+        assert_eq!(schema.axis(n_axis).count, schema.count_id("N").unwrap());
     }
 
     #[test]
