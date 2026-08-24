@@ -75,6 +75,9 @@ fails if one is dropped.
 | `graph_vertex_cascade` | one vertex removal killing five edges |
 | `bounded_numeric` | declared bounds flooring both length and value |
 | `schema_mixed` | scalar, repeat, array and numeric in one case |
+| `nested_repeat_occurrences` | one axis occurring once per outer instance |
+| `shared_count_two_arrays` | one count, two collections, one mask |
+| `shared_count_nested_instances` | a shared axis selecting differently per instance |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with

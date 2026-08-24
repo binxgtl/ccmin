@@ -216,6 +216,52 @@ fn cases() -> Vec<Case> {
         Pred::AnyNegative,
     );
 
+    // --- shared dimensions -----------------------------------------------
+    // One count, two arrays, one axis. The predicate needs position 2 of A and
+    // position 1 of B, and a single mask projects both, so neither position can
+    // be dropped and the survivors are their union.
+    add(
+        "shared_count_two_arrays",
+        Some(
+            "int N in 1..10
+array A[N] in -100..100
+array B[N] in -100..100
+",
+        ),
+        Shape::Auto,
+        "4
+1 2 3 4
+10 20 30 40
+"
+        .into(),
+        Pred::ContainsAll(&[3, 20]),
+    );
+    // The adversarial one: the same shared axis in two outer instances, each
+    // having to keep a different position.
+    add(
+        "shared_count_nested_instances",
+        Some(
+            "int T in 1..5
+repeat T {
+  int N in 1..10
+  array A[N] in -100..100
+               array B[N] in -100..100
+}
+",
+        ),
+        Shape::Auto,
+        "2
+3
+1 7 3
+10 11 12
+3
+4 5 6
+20 21 -9
+"
+        .into(),
+        Pred::ContainsAll(&[7, -9]),
+    );
+
     // --- nested repeats --------------------------------------------------
     // The inner block axis occurs once per outer instance. The predicate needs
     // outer 0's second inner iteration and outer 1's first, so the two
@@ -489,6 +535,8 @@ fn corpus_covers_every_reduction_path() {
         "bounded_numeric",
         "schema_mixed",
         "nested_repeat_occurrences",
+        "shared_count_two_arrays",
+        "shared_count_nested_instances",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

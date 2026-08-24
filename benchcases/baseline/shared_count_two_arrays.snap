@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `shared_count_two_arrays`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 9
+final_tokens = 5
+oracle_calls = 41
+predicate_holds = true
+[input]
+2
+0 3
+20 0

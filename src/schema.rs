@@ -236,16 +236,18 @@ impl Schema {
     pub fn axis_bounds(&self, axis: AxisId) -> Bounds {
         self.counts[self.axes[axis].count].bounds
     }
-
-    /// What the reducer asks: how far may whatever sizes this reference shrink?
-    pub fn sizing_bounds(&self, r: &Ref) -> Option<Bounds> {
-        self.sizing_axis(r).map(|axis| self.axis_bounds(axis))
-    }
 }
 
 /// Read only by the migration tests, which check the arena's shape directly.
 #[cfg(test)]
 impl Schema {
+    /// Bounds of whatever sizes this reference. The reducer resolves the axis
+    /// once per occurrence instead, so this survives only for the equivalence
+    /// test against the pre-arena block scan.
+    pub fn sizing_bounds(&self, r: &Ref) -> Option<Bounds> {
+        self.sizing_axis(r).map(|axis| self.axis_bounds(axis))
+    }
+
     pub fn count(&self, id: CountId) -> &Count {
         &self.counts[id]
     }
@@ -305,9 +307,10 @@ pub fn parse_schema(text: &str) -> Result<Rc<Schema>, String> {
         return Err("schema is empty".into());
     }
 
-    let mut derived = HashSet::new();
+    let mut uses = Uses::default();
     let mut all_names = HashSet::new();
-    validate(&items, &mut derived, &mut all_names)?;
+    validate(&items, &mut uses, &mut all_names)?;
+    let derived = uses.derived;
 
     let mut counts = Vec::new();
     let mut axes = Vec::new();
@@ -554,9 +557,17 @@ fn value_ref(no: usize, token: &str) -> Result<Ref, String> {
 
 // ---- validation ----------------------------------------------------------
 
+/// What each name is used for while validating. Sharing a count is legal;
+/// sharing one that *cascades* into another axis is not, yet.
+#[derive(Default)]
+struct Uses {
+    derived: HashSet<String>,
+    cascading: HashSet<String>,
+}
+
 fn validate(
     items: &[Decl],
-    derived: &mut HashSet<String>,
+    uses: &mut Uses,
     all_names: &mut HashSet<String>,
 ) -> Result<(), String> {
     // Ints usable as a count in this block. Restricting count references to the
@@ -571,42 +582,53 @@ fn validate(
             }
         }
 
-        let mut use_count = |r: &Ref, role: &str, owner: &str| -> Result<(), String> {
-            let Ref::Name(n) = r else { return Ok(()) };
-            if !ints_here.contains_key(n) {
-                return Err(format!(
-                    "`{owner}` uses `{n}` as its {role}, but `{n}` is not an `int` declared \
-                     earlier in the same block"
-                ));
-            }
-            if !derived.insert(n.clone()) {
-                return Err(format!(
-                    "`{n}` is used as a count by more than one declaration; that is not \
-                     supported, because the two would have to shrink together"
-                ));
-            }
-            Ok(())
-        };
+        let mut use_count =
+            |r: &Ref, role: &str, owner: &str, cascades: bool| -> Result<(), String> {
+                let Ref::Name(n) = r else { return Ok(()) };
+                if !ints_here.contains_key(n) {
+                    return Err(format!(
+                        "`{owner}` uses `{n}` as its {role}, but `{n}` is not an `int` declared \
+                         earlier in the same block"
+                    ));
+                }
+                let shared = !uses.derived.insert(n.clone());
+                if cascades {
+                    uses.cascading.insert(n.clone());
+                }
+                // Sharing is what lets `array A[N]` and `array B[N]` coexist:
+                // one axis, one selection, both projected together. A vertex
+                // count is the exception -- selecting vertices also drops
+                // edges, which changes a *different* count, and that
+                // propagation does not exist yet.
+                if shared && uses.cascading.contains(n) {
+                    return Err(format!(
+                        "`{n}` is used as a vertex count and also sizes something else; \
+                         selecting vertices changes the edge count too, and that is not \
+                         propagated yet"
+                    ));
+                }
+                Ok(())
+            };
 
         match decl {
             Decl::Int { name, bounds } => {
                 ints_here.insert(name.clone(), *bounds);
             }
-            Decl::Array { name, len, .. } => use_count(len, "length", name)?,
+            Decl::Array { name, len, .. } => use_count(len, "length", name, false)?,
             Decl::Matrix {
                 name, rows, cols, ..
             } => {
-                use_count(rows, "row count", name)?;
-                use_count(cols, "column count", name)?;
+                use_count(rows, "row count", name, false)?;
+                use_count(cols, "column count", name, false)?;
             }
-            Decl::Tree { name, verts } => use_count(verts, "vertex count", name)?,
+            Decl::Tree { name, verts } => use_count(verts, "vertex count", name, true)?,
             Decl::Graph { name, edges, verts } => {
-                use_count(edges, "edge count", name)?;
-                use_count(verts, "vertex count", name)?;
+                use_count(edges, "edge count", name, false)?;
+                use_count(verts, "vertex count", name, true)?;
             }
             Decl::Repeat { count, body } => {
-                use_count(count, "repeat count", "repeat")?;
-                validate(body, derived, all_names)?;
+                use_count(count, "repeat count", "repeat", false)?;
+                validate(body, uses, all_names)?;
             }
         }
     }
@@ -1005,6 +1027,24 @@ fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
         }
     }
 
+    // A shared count is written once per member. They must already agree,
+    // because a shared dimension is projected by a single mask; disagreement
+    // would be the silent last-write-wins that made v0.4 reject sharing.
+    #[cfg(debug_assertions)]
+    {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for (r, size) in &sizes {
+            if let Ref::Name(n) = r {
+                if let Some(previous) = seen.insert(n.as_str(), *size) {
+                    debug_assert_eq!(
+                        previous, *size,
+                        "members sharing count {n} disagree: {previous} vs {size}"
+                    );
+                }
+            }
+        }
+    }
+
     for (r, size) in sizes {
         let Ref::Name(n) = r else { continue };
         let Some(id) = schema.count_id(n) else {
@@ -1099,6 +1139,18 @@ impl SchemaData {
         out
     }
 
+    fn all_occurrences(&self) -> Vec<Occurrence> {
+        let mut out = Vec::new();
+        occurrences(
+            &self.schema,
+            &self.schema.items,
+            &self.values,
+            &Vec::new(),
+            &mut out,
+        );
+        out
+    }
+
     /// Delete data: array elements, matrix rows and columns, edges, vertices,
     /// and whole repeat iterations. Declared counts are recomputed after each
     /// accepted edit, and no count is taken below its declared minimum.
@@ -1108,10 +1160,10 @@ impl SchemaData {
         // the counter only bounds pathological schemas.
         for _ in 0..512 {
             let mut changed = false;
-            for path in data.all_sites() {
-                if shrink_site(&mut data, &path, accept) {
+            for occ in data.all_occurrences() {
+                if shrink_occurrence(&mut data, &occ, accept) {
                     changed = true;
-                    // Removing an iteration invalidates deeper paths.
+                    // Removing an iteration invalidates deeper occurrences.
                     break;
                 }
             }
@@ -1183,249 +1235,302 @@ impl SchemaData {
     }
 }
 
-/// One selection on one axis occurrence.
+/// Which dimension of a declaration an axis indexes.
 ///
-/// Every structural reduction is the same two steps: choose which of the
-/// occurrence's `0..extent` positions survive, then project the data onto the
-/// survivors. Splitting them is what lets a selection later fan out to several
-/// collections, and to cascade into other axes.
+/// A matrix is indexed by two axes, a graph by two (its edge list and its
+/// vertex set), everything else by one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Elements,
+    Rows,
+    Cols,
+    Edges,
+    GraphVertices,
+    /// Distinguished from `GraphVertices` because a tree may only drop leaves.
+    TreeVertices,
+    Iterations,
+}
+
+/// One declaration that an axis occurrence indexes, and how.
+#[derive(Clone, Debug)]
+struct Member {
+    decl: usize,
+    role: Role,
+}
+
+/// An **axis occurrence**: an axis together with the block instantiation it
+/// lives in.
 ///
-/// The keep-mask is a **local**. It is computed for the occurrence named by
-/// `path` and applied there, so two instantiations of one declaration select
-/// independently and nothing keyed by `AxisId` is ever written. That is the
-/// property revision 6 exists to protect; see
-/// `two_instances_of_one_axis_reach_different_masks`.
-///
-/// Returns the projected value when the selection shrank, `None` otherwise.
-fn select_at(
-    data: &SchemaData,
-    path: &[usize],
-    extent: usize,
-    min: usize,
-    allow_empty: bool,
-    project: &dyn Fn(&[usize]) -> Value,
-    accept: &mut dyn FnMut(&SchemaData) -> bool,
-) -> Option<Value> {
-    if extent <= min {
-        return None;
+/// `prefix` names that instantiation and is an ordinary `Path` prefix, so this
+/// introduces no new addressing -- a declaration inside a `repeat` body has one
+/// occurrence per iteration because it has one prefix per iteration. Two
+/// occurrences of the same `AxisId` are unrelated and select independently.
+#[derive(Clone, Debug)]
+struct Occurrence {
+    prefix: Path,
+    axis: AxisId,
+    /// Every declaration in this instantiation sized by this axis. More than
+    /// one means a shared dimension: they select together, by construction.
+    members: Vec<Member>,
+}
+
+impl Occurrence {
+    fn path_of(&self, member: &Member) -> Path {
+        let mut path = self.prefix.clone();
+        path.push(member.decl);
+        path
     }
+}
+
+fn sizing_roles(decl: &Decl) -> Vec<(&Ref, Role)> {
+    match decl {
+        Decl::Int { .. } => vec![],
+        Decl::Array { len, .. } => vec![(len, Role::Elements)],
+        Decl::Matrix { rows, cols, .. } => vec![(rows, Role::Rows), (cols, Role::Cols)],
+        Decl::Tree { verts, .. } => vec![(verts, Role::TreeVertices)],
+        Decl::Graph { edges, verts, .. } => {
+            vec![(edges, Role::Edges), (verts, Role::GraphVertices)]
+        }
+        Decl::Repeat { count, .. } => vec![(count, Role::Iterations)],
+    }
+}
+
+/// How many positions this member currently has along `role`.
+fn extent_of(value: &Value, role: Role) -> Option<usize> {
+    Some(match (value, role) {
+        (Value::Array(a), Role::Elements) => a.len(),
+        (Value::Matrix(g), Role::Rows) => g.len(),
+        (Value::Matrix(g), Role::Cols) => g.first().map_or(0, |r| r.len()),
+        (Value::Graph(g), Role::Edges) => g.edges.len(),
+        (Value::Graph(g), Role::GraphVertices | Role::TreeVertices) => g.n,
+        (Value::Repeat(iters), Role::Iterations) => iters.len(),
+        _ => return None,
+    })
+}
+
+/// Rebuild one member from the surviving positions.
+fn project_member(value: &Value, role: Role, keep: &[usize]) -> Option<Value> {
+    Some(match (value, role) {
+        (Value::Array(a), Role::Elements) => {
+            Value::Array(keep.iter().filter_map(|&i| a.get(i).copied()).collect())
+        }
+        (Value::Matrix(g), Role::Rows) => {
+            Value::Matrix(keep.iter().filter_map(|&i| g.get(i).cloned()).collect())
+        }
+        (Value::Matrix(g), Role::Cols) => Value::Matrix(select_columns(g, keep)),
+        (Value::Graph(g), Role::Edges) => Value::Graph(
+            g.with_edges(
+                keep.iter()
+                    .filter_map(|&i| g.edges.get(i).copied())
+                    .collect(),
+            ),
+        ),
+        // Selecting vertices also drops every edge with a removed endpoint and
+        // relabels the survivors. That is a cascade into the edge-count axis,
+        // which is why a vertex count may not yet be shared (see `validate`).
+        (Value::Graph(g), Role::GraphVertices) => {
+            let labels: Vec<usize> = keep.iter().map(|&i| i + 1).collect();
+            Value::Graph(g.induced(&labels))
+        }
+        (Value::Repeat(iters), Role::Iterations) => {
+            Value::Repeat(keep.iter().filter_map(|&i| iters.get(i).cloned()).collect())
+        }
+        _ => return None,
+    })
+}
+
+/// Every axis occurrence in this instantiation, in declaration order.
+///
+/// Order matters: the reducer visits occurrences in this order and restarts on
+/// the first accepted change, so it is part of the search path the benchcases
+/// pin.
+fn occurrences(
+    schema: &Schema,
+    items: &[Decl],
+    values: &[Value],
+    prefix: &Path,
+    out: &mut Vec<Occurrence>,
+) {
+    // Axes already seen in *this* block instantiation. Scoped per call, so a
+    // nested block never merges with its parent.
+    let mut here: Vec<(AxisId, usize)> = Vec::new();
+
+    for (i, decl) in items.iter().enumerate() {
+        for (r, role) in sizing_roles(decl) {
+            let Some(axis) = schema.sizing_axis(r) else {
+                continue;
+            };
+            let member = Member { decl: i, role };
+            match here.iter().find(|(a, _)| *a == axis) {
+                Some((_, at)) => out[*at].members.push(member),
+                None => {
+                    here.push((axis, out.len()));
+                    out.push(Occurrence {
+                        prefix: prefix.clone(),
+                        axis,
+                        members: vec![member],
+                    });
+                }
+            }
+        }
+        if let (Decl::Repeat { body, .. }, Some(Value::Repeat(iters))) = (decl, values.get(i)) {
+            for (k, iter) in iters.iter().enumerate() {
+                let mut inner = prefix.clone();
+                inner.push(i);
+                inner.push(k);
+                occurrences(schema, body, iter, &inner, out);
+            }
+        }
+    }
+}
+
+/// Build the candidate in which this occurrence keeps only `keep`.
+///
+/// Every member is projected with the *same* mask, which is what makes a shared
+/// dimension stay consistent: the declarations cannot disagree because they are
+/// never asked separately.
+fn project_occurrence(data: &SchemaData, occ: &Occurrence, keep: &[usize]) -> Option<SchemaData> {
+    let mut trial = data.clone();
+    for member in &occ.members {
+        let path = occ.path_of(member);
+        let current = value_at(&trial.values, &path)?;
+        let projected = project_member(current, member.role, keep)?;
+        put(&mut trial, &path, projected);
+    }
+    trial.resync();
+    Some(trial)
+}
+
+fn shrink_occurrence(
+    data: &mut SchemaData,
+    occ: &Occurrence,
+    accept: &mut dyn FnMut(&SchemaData) -> bool,
+) -> bool {
+    let schema = Rc::clone(&data.schema);
+    let bounds = schema.axis_bounds(occ.axis);
+
+    // A tree may only shed leaves, so it runs a constrained sequence of
+    // selections rather than one. Validation keeps it a sole member.
+    if occ.members.iter().any(|m| m.role == Role::TreeVertices) {
+        return prune_tree(data, occ, bounds.min_count().max(1), accept);
+    }
+
+    let Some(extent) = occurrence_extent(data, occ) else {
+        return false;
+    };
+    let min = match occ.members.iter().any(|m| m.role == Role::GraphVertices) {
+        true => bounds.min_count().max(1),
+        false => bounds.min_count(),
+    };
+    let allow_empty = !occ.members.iter().any(|m| m.role == Role::GraphVertices);
+    if extent <= min {
+        return false;
+    }
+
     let positions: Vec<usize> = (0..extent).collect();
-    let mut test = |candidate: &[usize]| try_put(data, path, project(candidate), accept);
+    let mut test = |candidate: &[usize]| match project_occurrence(data, occ, candidate) {
+        Some(trial) => accept(&trial),
+        None => false,
+    };
     let kept = if allow_empty {
         ddmin_floor(&positions, min, &mut test)
     } else {
         ddmin_min_len(&positions, min, &mut test)
     };
-    // ddmin only ever removes, so the mask can only shrink -- which is what
-    // keeps the fixpoint argument in section 5 of the design note valid.
+    // ddmin only removes, so the survivor set can only shrink relative to the
+    // occurrence's domain. That is what keeps the fixpoint argument valid.
     debug_assert!(kept.len() <= extent);
-    (kept.len() != extent).then(|| project(&kept))
+    if kept.len() == extent {
+        return false;
+    }
+    match project_occurrence(data, occ, &kept) {
+        Some(next) => {
+            *data = next;
+            true
+        }
+        None => false,
+    }
 }
 
-fn shrink_site(
+/// Every member of an occurrence must currently have the same extent -- that is
+/// what sharing a count means. Disagreement is a bug, not an input error.
+fn occurrence_extent(data: &SchemaData, occ: &Occurrence) -> Option<usize> {
+    let mut agreed: Option<usize> = None;
+    for member in &occ.members {
+        let value = value_at(&data.values, &occ.path_of(member))?;
+        let extent = extent_of(value, member.role)?;
+        match agreed {
+            None => agreed = Some(extent),
+            Some(previous) => debug_assert_eq!(
+                previous, extent,
+                "members of one axis occurrence disagree on extent"
+            ),
+        }
+    }
+    agreed
+}
+
+fn prune_tree(
     data: &mut SchemaData,
-    path: &[usize],
+    occ: &Occurrence,
+    min: usize,
     accept: &mut dyn FnMut(&SchemaData) -> bool,
 ) -> bool {
-    let schema = Rc::clone(&data.schema);
-    let Some(decl) = decl_at(&schema.items, path) else {
+    let Some(member) = occ.members.first() else {
         return false;
     };
-    let Some(value) = value_at(&data.values, path).cloned() else {
+    let path = occ.path_of(member);
+    let Some(Value::Graph(tree)) = value_at(&data.values, &path).cloned() else {
         return false;
     };
 
-    match (decl, value) {
-        (Decl::Array { len, .. }, Value::Array(arr)) => {
-            // A literal length is fixed by the schema and must not move.
-            let Some(bounds) = schema.sizing_bounds(len) else {
-                return false;
-            };
-            let project = |keep: &[usize]| Value::Array(keep.iter().map(|&i| arr[i]).collect());
-            let extent = arr.len();
-            match select_at(
-                data,
-                path,
-                extent,
-                bounds.min_count(),
-                true,
-                &project,
-                accept,
-            ) {
-                Some(reduced) => commit(data, path, reduced, true),
-                None => false,
-            }
+    let mut current = tree;
+    let mut changed = false;
+    loop {
+        let leaves = current.leaves();
+        if leaves.len() < 2 || current.n <= min {
+            break;
         }
-
-        (Decl::Matrix { rows, cols, .. }, Value::Matrix(grid)) => {
-            // Two axes index one collection, so it takes two selections.
-            if let Some(bounds) = schema.sizing_bounds(rows) {
-                let project =
-                    |keep: &[usize]| Value::Matrix(keep.iter().map(|&i| grid[i].clone()).collect());
-                let extent = grid.len();
-                if let Some(reduced) = select_at(
-                    data,
-                    path,
-                    extent,
-                    bounds.min_count(),
-                    true,
-                    &project,
-                    accept,
-                ) {
-                    return commit(data, path, reduced, true);
-                }
-            }
-            if let Some(bounds) = schema.sizing_bounds(cols) {
-                let project = |keep: &[usize]| Value::Matrix(select_columns(&grid, keep));
-                let extent = grid.first().map_or(0, |r| r.len());
-                if let Some(reduced) = select_at(
-                    data,
-                    path,
-                    extent,
-                    bounds.min_count(),
-                    true,
-                    &project,
-                    accept,
-                ) {
-                    return commit(data, path, reduced, true);
-                }
-            }
-            false
+        let mut is_leaf = vec![false; current.n + 1];
+        for leaf in &leaves {
+            is_leaf[*leaf] = true;
         }
+        let internal: Vec<usize> = (1..=current.n).filter(|v| !is_leaf[*v]).collect();
+        let base = current.clone();
+        // Keep enough leaves to satisfy the declared vertex floor.
+        let min_leaves = min.saturating_sub(internal.len());
+        let build = |keep: &[usize]| {
+            let mut kept = internal.clone();
+            kept.extend(keep.iter().filter_map(|&i| leaves.get(i).copied()));
+            kept.sort_unstable();
+            base.induced(&kept)
+        };
 
-        (Decl::Graph { edges, verts, .. }, Value::Graph(graph)) => {
-            if let Some(bounds) = schema.sizing_bounds(edges) {
-                let project = |keep: &[usize]| {
-                    Value::Graph(graph.with_edges(keep.iter().map(|&i| graph.edges[i]).collect()))
-                };
-                let extent = graph.edges.len();
-                if let Some(reduced) = select_at(
-                    data,
-                    path,
-                    extent,
-                    bounds.min_count(),
-                    true,
-                    &project,
-                    accept,
-                ) {
-                    return commit(data, path, reduced, true);
-                }
-            }
-            if let Some(bounds) = schema.sizing_bounds(verts) {
-                // The one cascade that already exists: dropping a vertex also
-                // drops every edge with a removed endpoint and relabels the
-                // survivors. `induced` is that projection.
-                let project = |keep: &[usize]| {
-                    let labels: Vec<usize> = keep.iter().map(|&i| i + 1).collect();
-                    Value::Graph(graph.induced(&labels))
-                };
-                let extent = graph.n;
-                if let Some(reduced) = select_at(
-                    data,
-                    path,
-                    extent,
-                    bounds.min_count().max(1),
-                    false,
-                    &project,
-                    accept,
-                ) {
-                    return commit(data, path, reduced, true);
-                }
-            }
-            false
+        let positions: Vec<usize> = (0..leaves.len()).collect();
+        let kept_leaves = ddmin_min_len(&positions, min_leaves, |candidate| {
+            let mut trial = data.clone();
+            put(&mut trial, &path, Value::Graph(build(candidate)));
+            trial.resync();
+            accept(&trial)
+        });
+        if kept_leaves.len() == leaves.len() {
+            break;
         }
-
-        (Decl::Tree { verts, .. }, Value::Graph(tree)) => {
-            let Some(bounds) = schema.sizing_bounds(verts) else {
-                return false;
-            };
-            let min = bounds.min_count().max(1);
-            // A constrained selection: only leaves may be dropped, or the
-            // result stops being a tree. Pruning exposes new leaves, so this is
-            // a sequence of selections rather than one.
-            let mut current = tree.clone();
-            let mut changed = false;
-            loop {
-                let leaves = current.leaves();
-                if leaves.len() < 2 || current.n <= min {
-                    break;
-                }
-                let mut is_leaf = vec![false; current.n + 1];
-                for leaf in &leaves {
-                    is_leaf[*leaf] = true;
-                }
-                let internal: Vec<usize> = (1..=current.n).filter(|v| !is_leaf[*v]).collect();
-                let base = current.clone();
-                // Keep enough leaves to satisfy the declared vertex floor.
-                let min_leaves = min.saturating_sub(internal.len());
-                let project = |keep: &[usize]| {
-                    let mut kept = internal.clone();
-                    kept.extend(keep.iter().map(|&i| leaves[i]));
-                    kept.sort_unstable();
-                    Value::Graph(base.induced(&kept))
-                };
-                let extent = leaves.len();
-                let Some(Value::Graph(next)) =
-                    select_at(data, path, extent, min_leaves, false, &project, accept)
-                else {
-                    break;
-                };
-                current = next;
-                changed = true;
-            }
-            commit(data, path, Value::Graph(current), changed)
-        }
-
-        (Decl::Repeat { count, .. }, Value::Repeat(iters)) => {
-            let Some(bounds) = schema.sizing_bounds(count) else {
-                return false;
-            };
-            let project =
-                |keep: &[usize]| Value::Repeat(keep.iter().map(|&i| iters[i].clone()).collect());
-            let extent = iters.len();
-            match select_at(
-                data,
-                path,
-                extent,
-                bounds.min_count(),
-                true,
-                &project,
-                accept,
-            ) {
-                Some(reduced) => commit(data, path, reduced, true),
-                None => false,
-            }
-        }
-
-        _ => false,
+        current = build(&kept_leaves);
+        changed = true;
     }
+
+    if changed {
+        put(data, &path, Value::Graph(current));
+        data.resync();
+    }
+    changed
 }
 
 fn select_columns(grid: &[Vec<i64>], keep: &[usize]) -> Vec<Vec<i64>> {
     grid.iter()
         .map(|row| keep.iter().filter_map(|c| row.get(*c).copied()).collect())
         .collect()
-}
-
-/// Render a candidate edit and ask the oracle, without disturbing `data`.
-fn try_put(
-    data: &SchemaData,
-    path: &[usize],
-    value: Value,
-    accept: &mut dyn FnMut(&SchemaData) -> bool,
-) -> bool {
-    let mut trial = data.clone();
-    put(&mut trial, path, value);
-    trial.resync();
-    accept(&trial)
-}
-
-fn commit(data: &mut SchemaData, path: &[usize], value: Value, changed: bool) -> bool {
-    if changed {
-        put(data, path, value);
-        data.resync();
-    }
-    changed
 }
 
 #[cfg(test)]
@@ -1577,11 +1682,123 @@ mod tests {
         assert!(err.contains("input ended"), "{err}");
     }
 
+    /// Two declarations sized by one count are one axis occurrence, so a single
+    /// mask projects both. They cannot disagree, because they are never asked
+    /// separately.
+    ///
+    /// The predicate needs position 2 of `A` and position 1 of `B`. With one
+    /// shared mask neither can be dropped, so the survivor set is their union
+    /// and both arrays keep two elements.
     #[test]
-    fn a_count_cannot_be_shared_by_two_declarations() {
-        // The two arrays would have to shrink in lockstep; refusing is honest.
-        let err = parse_schema("int N in 1..10\narray A[N]\narray B[N]\n").unwrap_err();
-        assert!(err.contains("more than one declaration"), "{err}");
+    fn two_declarations_sharing_a_count_select_together() {
+        let text = "int N in 1..10\narray A[N] in -100..100\narray B[N] in -100..100\n";
+        let data = build(text, "4\n1 2 3 4\n10 20 30 40\n");
+
+        let reduced = reduce(&data, |t| {
+            let v = ints(t);
+            v.contains(&3) && v.contains(&20)
+        });
+
+        // N, then A, then B. One cardinality, two synchronised projections.
+        assert_eq!(ints(&reduced.render()), vec![2, 0, 3, 20, 0]);
+
+        let (Value::Int(n), Value::Array(a), Value::Array(b)) =
+            (&reduced.values[0], &reduced.values[1], &reduced.values[2])
+        else {
+            panic!("unexpected shape")
+        };
+        assert_eq!(*n, 2);
+        assert_eq!(a.len(), b.len(), "a shared count cannot desynchronise");
+        assert_eq!(a.len() as i64, *n);
+        assert_eq!(
+            parse_input(&reduced.schema, &reduced.render()).unwrap(),
+            reduced
+        );
+    }
+
+    /// One count indexing both dimensions of a matrix. The same mask applies to
+    /// rows and columns, so a square stays square.
+    #[test]
+    fn a_square_matrix_shares_one_count_across_both_axes() {
+        let text = "int N in 1..10\nmatrix G[N][N] in 0..9\n";
+        let data = build(text, "3\n1 0 0\n0 5 0\n0 0 9\n");
+
+        let reduced = reduce(&data, |t| {
+            let v = ints(t);
+            v.contains(&5) && v.contains(&9)
+        });
+
+        assert_eq!(ints(&reduced.render()), vec![2, 5, 0, 0, 9]);
+        let Value::Matrix(grid) = &reduced.values[1] else {
+            panic!("expected a matrix")
+        };
+        assert_eq!(grid.len(), 2);
+        for row in grid {
+            assert_eq!(row.len(), grid.len(), "the matrix stopped being square");
+        }
+    }
+
+    /// The adversarial case: one shared axis, two outer instances, different
+    /// survivors in each. This is the relation-era shape of the bug revision 5
+    /// exposed -- anything keyed by the static `AxisId` gives both the same
+    /// mask.
+    #[test]
+    fn a_shared_count_selects_independently_in_each_outer_instance() {
+        let text = "int T in 1..5\nrepeat T {\n  int N in 1..10\n  \
+                    array A[N] in -100..100\n  array B[N] in -100..100\n}\n";
+        let data = build(text, "2\n3\n1 7 3\n10 11 12\n3\n4 5 6\n20 21 -9\n");
+
+        // 7 lives at position 1 of the first instance, -9 at position 2 of the
+        // second: the two occurrences must keep different positions.
+        let reduced = reduce(&data, |t| {
+            let v = ints(t);
+            v.contains(&7) && v.contains(&-9)
+        });
+
+        assert_eq!(ints(&reduced.render()), vec![2, 1, 7, 0, 1, 0, -9]);
+
+        let Value::Repeat(iters) = &reduced.values[1] else {
+            panic!("expected a repeat")
+        };
+        assert_eq!(iters.len(), 2);
+        for (k, iter) in iters.iter().enumerate() {
+            let (Value::Int(n), Value::Array(a), Value::Array(b)) = (&iter[0], &iter[1], &iter[2])
+            else {
+                panic!("unexpected shape in instance {k}")
+            };
+            assert_eq!(a.len(), b.len(), "instance {k} desynchronised");
+            assert_eq!(a.len() as i64, *n, "instance {k} count disagrees");
+        }
+        // The kept positions really did differ: 7 came from index 1, -9 from 2.
+        let survivors: Vec<(Vec<i64>, Vec<i64>)> = iters
+            .iter()
+            .map(|iter| match (&iter[1], &iter[2]) {
+                (Value::Array(a), Value::Array(b)) => (a.clone(), b.clone()),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(survivors[0], (vec![7], vec![0]));
+        assert_eq!(survivors[1], (vec![0], vec![-9]));
+    }
+
+    /// Sharing is legal; sharing a *vertex* count is not, yet. Selecting
+    /// vertices also drops edges, which changes a different count, and that
+    /// propagation does not exist. Rejected with an explanation rather than
+    /// silently desynchronising.
+    #[test]
+    fn sharing_a_vertex_count_is_rejected_with_a_reason() {
+        let err = parse_schema(
+            "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\narray W[N] in 0..9\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("not propagated yet"), "{err}");
+
+        // The other order is caught too.
+        let err = parse_schema(
+            "int N in 1..10\nint M in 0..20\narray W[N] in 0..9\ngraph E[M] vertices N\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("not propagated yet"), "{err}");
     }
 
     #[test]
