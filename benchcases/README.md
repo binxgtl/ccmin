@@ -79,6 +79,8 @@ fails if one is dropped.
 | `shared_count_two_arrays` | one count, two collections, one mask |
 | `shared_count_nested_instances` | a shared axis selecting differently per instance |
 | `graph_weighted_edges` | a vertex selection inducing an edge selection |
+| `graph_two_inducers_one_target` | two induced masks intersecting |
+| `graph_cascade_nested_instances` | one cascade per repeat instance |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with

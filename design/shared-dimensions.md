@@ -680,8 +680,9 @@ property of an array; it is which axis the array points at (§6).
    Shared counts fall out: one mask, every member.
 3. Extract vertex -> edge positional induction.              done
    The first real "selection on A induces selection on B".
-4. Minimal occurrence-local worklist around induced
-   selections. Keep it embarrassingly small.
+4. Minimal occurrence-local worklist around induced          done
+   selections. One event, intersection-only merge, fixed
+   point before projection.
 5. Index elements, generalising what graph endpoints are.
 6. RequireCardinality, once a relation induces only a size.
 7. Generalise validate / induce once two relation forms

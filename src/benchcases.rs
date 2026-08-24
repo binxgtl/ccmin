@@ -286,6 +286,31 @@ graph E[M] vertices N
         Pred::ContainsAll(&[10, 40]),
     );
 
+    // Two graphs sharing both the vertex axis and the edge axis: one vertex
+    // selection emits two induced edge masks, and the fixed point intersects
+    // them.
+    add(
+        "graph_two_inducers_one_target",
+        Some(
+            "int N in 1..10
+int M in 0..20
+graph E1[M] vertices N
+             graph E2[M] vertices N
+",
+        ),
+        Shape::Auto,
+        "4 3
+1 2
+2 3
+3 4
+1 4
+1 3
+2 3
+"
+        .into(),
+        Pred::MinTokens(6),
+    );
+
     // --- nested repeats --------------------------------------------------
     // The inner block axis occurs once per outer instance. The predicate needs
     // outer 0's second inner iteration and outer 1's first, so the two
@@ -318,6 +343,37 @@ repeat T {
 "
         .into(),
         Pred::ContainsAll(&[12, 20]),
+    );
+
+    // A graph cascade inside a repeat: the same static edge axis exists once
+    // per instance and must induce a different mask in each.
+    add(
+        "graph_cascade_nested_instances",
+        Some(
+            "int T in 1..3
+repeat T {
+  int N in 1..10
+  int M in 0..20
+               graph E[M] vertices N
+  array W[M] in 0..99
+}
+",
+        ),
+        Shape::Auto,
+        "2
+3 3
+1 2
+2 3
+1 3
+10 20 30
+3 3
+1 2
+2 3
+1 3
+60 61 62
+"
+        .into(),
+        Pred::ContainsAll(&[30, 61]),
     );
 
     // --- the unstructured fallback --------------------------------------
@@ -562,6 +618,8 @@ fn corpus_covers_every_reduction_path() {
         "shared_count_two_arrays",
         "shared_count_nested_instances",
         "graph_weighted_edges",
+        "graph_two_inducers_one_target",
+        "graph_cascade_nested_instances",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

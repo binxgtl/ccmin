@@ -31,7 +31,7 @@
 
 use crate::model::{Edge, GraphCase};
 use crate::reduce::{ddmin_floor, ddmin_min_len, shrink_ints_toward, shrink_value_toward};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 // ---- grammar ------------------------------------------------------------
@@ -1311,37 +1311,6 @@ fn extent_of(value: &Value, role: Role) -> Option<usize> {
     })
 }
 
-/// Rebuild one member from the surviving positions.
-fn project_member(value: &Value, role: Role, keep: &[usize]) -> Option<Value> {
-    Some(match (value, role) {
-        (Value::Array(a), Role::Elements) => {
-            Value::Array(keep.iter().filter_map(|&i| a.get(i).copied()).collect())
-        }
-        (Value::Matrix(g), Role::Rows) => {
-            Value::Matrix(keep.iter().filter_map(|&i| g.get(i).cloned()).collect())
-        }
-        (Value::Matrix(g), Role::Cols) => Value::Matrix(select_columns(g, keep)),
-        (Value::Graph(g), Role::Edges) => Value::Graph(
-            g.with_edges(
-                keep.iter()
-                    .filter_map(|&i| g.edges.get(i).copied())
-                    .collect(),
-            ),
-        ),
-        // Selecting vertices also drops every edge with a removed endpoint and
-        // relabels the survivors. That is a cascade into the edge-count axis,
-        // which is why a vertex count may not yet be shared (see `validate`).
-        (Value::Graph(g), Role::GraphVertices) => {
-            let labels: Vec<usize> = keep.iter().map(|&i| i + 1).collect();
-            Value::Graph(g.induced(&labels))
-        }
-        (Value::Repeat(iters), Role::Iterations) => {
-            Value::Repeat(keep.iter().filter_map(|&i| iters.get(i).cloned()).collect())
-        }
-        _ => return None,
-    })
-}
-
 /// Every axis occurrence in this instantiation, in declaration order.
 ///
 /// Order matters: the reducer visits occurrences in this order and restarts on
@@ -1409,72 +1378,236 @@ fn induced_edge_keep(graph: &GraphCase, vertex_keep: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Build the candidate in which this occurrence keeps only `keep`.
+/// Sorted intersection. The only way a mask ever changes.
+fn intersect(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// An occurrence, keyed the way the solver addresses it: by the concrete block
+/// instantiation and axis, never by a static `AxisId` alone.
+type OccurrenceKey = (Path, AxisId);
+
+/// The survivor set of every occurrence a candidate touches.
 ///
-/// Every member is projected with the *same* mask, which is what makes a shared
-/// dimension stay consistent: the declarations cannot disagree because they are
-/// never asked separately.
+/// A `BTreeMap` rather than a `HashMap` so iteration -- and therefore the
+/// projection it drives -- is deterministic.
+struct Propagation {
+    masks: BTreeMap<OccurrenceKey, Vec<usize>>,
+    /// Successful narrowings. Every one strictly removes at least one position,
+    /// so this is bounded by the total number of positions in play. Asserted in
+    /// tests as a guard against a re-enqueue cycle.
+    updates: usize,
+}
+
+impl Propagation {
+    /// The merge rule, and the only one: intersect, and report whether that
+    /// actually removed anything. Never widens.
+    fn narrow(&mut self, key: OccurrenceKey, incoming: &[usize], domain: &[usize]) -> bool {
+        let current = self.masks.entry(key).or_insert_with(|| domain.to_vec());
+        let merged = intersect(current, incoming);
+        if merged == *current {
+            return false;
+        }
+        *current = merged;
+        self.updates += 1;
+        true
+    }
+}
+
+/// Run the selection to a fixed point *before* projecting anything.
+///
+/// Projecting between events would let a later inducer read data whose
+/// positional identity had already been destroyed, so every inducer derives
+/// from the original data plus the current source mask.
+fn propagate(
+    data: &SchemaData,
+    seed: &Occurrence,
+    seed_keep: &[usize],
+    all: &[Occurrence],
+) -> Propagation {
+    let schema = Rc::clone(&data.schema);
+    let mut state = Propagation {
+        masks: BTreeMap::new(),
+        updates: 0,
+    };
+    state
+        .masks
+        .insert((seed.prefix.clone(), seed.axis), seed_keep.to_vec());
+
+    let mut queue: VecDeque<OccurrenceKey> = VecDeque::new();
+    queue.push_back((seed.prefix.clone(), seed.axis));
+
+    while let Some(key) = queue.pop_front() {
+        let Some(occ) = all.iter().find(|o| o.prefix == key.0 && o.axis == key.1) else {
+            continue;
+        };
+        let Some(source) = state.masks.get(&key).cloned() else {
+            continue;
+        };
+
+        for member in &occ.members {
+            // The one induction rule that exists: keeping a set of vertices
+            // determines which edge positions can survive.
+            if member.role != Role::GraphVertices {
+                continue;
+            }
+            let path = occ.path_of(member);
+            let (Some(Value::Graph(graph)), Some(Decl::Graph { edges, .. })) =
+                (value_at(&data.values, &path), decl_at(&schema.items, &path))
+            else {
+                continue;
+            };
+            let Some(edge_axis) = schema.sizing_axis(edges) else {
+                continue;
+            };
+            // Derived from the ORIGINAL edge list, never from a projection.
+            let induced = induced_edge_keep(graph, &source);
+
+            let target: OccurrenceKey = (occ.prefix.clone(), edge_axis);
+            let Some(target_occ) = all.iter().find(|o| (o.prefix.clone(), o.axis) == target) else {
+                continue;
+            };
+            let Some(extent) = occurrence_extent(data, target_occ) else {
+                continue;
+            };
+            let domain: Vec<usize> = (0..extent).collect();
+            if state.narrow(target.clone(), &induced, &domain) {
+                queue.push_back(target);
+            }
+        }
+    }
+
+    state
+}
+
+/// Keep `vertex_keep` vertices and `edge_keep` edge positions, relabelling the
+/// survivors to `1..=k`. Either mask absent means "all of them".
+///
+/// One `Value::Graph` belongs to two occurrences, so it can receive two masks;
+/// applying them together is what lets projection happen once.
+fn project_graph(
+    g: &GraphCase,
+    vertex_keep: Option<&[usize]>,
+    edge_keep: Option<&[usize]>,
+) -> GraphCase {
+    let kept: Vec<usize> = match vertex_keep {
+        Some(v) => v.to_vec(),
+        None => (0..g.n).collect(),
+    };
+    let mut remap = vec![0usize; g.n + 1];
+    for (new, &position) in kept.iter().enumerate() {
+        if position < g.n {
+            remap[position + 1] = new + 1;
+        }
+    }
+    let edges = g
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| match edge_keep {
+            Some(keep) => keep.binary_search(i).is_ok(),
+            None => true,
+        })
+        .filter_map(|(_, e)| {
+            let (u, v) = (remap[e.u], remap[e.v]);
+            (u != 0 && v != 0).then_some(Edge { u, v })
+        })
+        .collect();
+    GraphCase {
+        n: kept.len(),
+        edges,
+    }
+}
+
+/// Apply every mask that reached one value, in one step.
+fn apply_masks(value: &Value, ops: &[(Role, Vec<usize>)]) -> Option<Value> {
+    let find = |wanted: Role| {
+        ops.iter()
+            .find(|(role, _)| *role == wanted)
+            .map(|(_, mask)| mask.as_slice())
+    };
+    Some(match value {
+        Value::Graph(g) => Value::Graph(project_graph(
+            g,
+            find(Role::GraphVertices),
+            find(Role::Edges),
+        )),
+        Value::Matrix(grid) => {
+            let mut out = grid.clone();
+            if let Some(rows) = find(Role::Rows) {
+                out = rows.iter().filter_map(|&i| out.get(i).cloned()).collect();
+            }
+            if let Some(cols) = find(Role::Cols) {
+                out = select_columns(&out, cols);
+            }
+            Value::Matrix(out)
+        }
+        Value::Array(a) => {
+            let mask = find(Role::Elements)?;
+            Value::Array(mask.iter().filter_map(|&i| a.get(i).copied()).collect())
+        }
+        Value::Repeat(iters) => {
+            let mask = find(Role::Iterations)?;
+            Value::Repeat(mask.iter().filter_map(|&i| iters.get(i).cloned()).collect())
+        }
+        Value::Int(_) => return None,
+    })
+}
+
+/// Project the whole fixed point onto the data, reading originals throughout.
+fn project_fixpoint(
+    data: &SchemaData,
+    state: &Propagation,
+    all: &[Occurrence],
+) -> Option<SchemaData> {
+    // Deterministic: BTreeMap over paths, fed from a BTreeMap over occurrences.
+    let mut edits: BTreeMap<Path, Vec<(Role, Vec<usize>)>> = BTreeMap::new();
+    for ((prefix, axis), mask) in &state.masks {
+        let Some(occ) = all.iter().find(|o| &o.prefix == prefix && o.axis == *axis) else {
+            continue;
+        };
+        for member in &occ.members {
+            edits
+                .entry(occ.path_of(member))
+                .or_default()
+                .push((member.role, mask.clone()));
+        }
+    }
+
+    let mut trial = data.clone();
+    for (path, ops) in edits {
+        let original = value_at(&data.values, &path)?;
+        let projected = apply_masks(original, &ops)?;
+        put(&mut trial, &path, projected);
+    }
+    // Downstream bookkeeping only: resync observes members that are already
+    // consistent, it does not take part in deciding which positions survived.
+    trial.resync();
+    Some(trial)
+}
+
+/// Build the candidate in which this occurrence keeps only `keep`.
 fn project_occurrence(
     data: &SchemaData,
     occ: &Occurrence,
     keep: &[usize],
-    siblings: &[Occurrence],
+    all: &[Occurrence],
 ) -> Option<SchemaData> {
-    let schema = Rc::clone(&data.schema);
-    let mut trial = data.clone();
-    let mut written: Vec<Path> = Vec::new();
-    // Selections this projection induces on *other* occurrences in the same
-    // block instantiation. The first concrete instance of
-    //     selection on occurrence A  ->  induced selection on occurrence B
-    let mut induced: Vec<(AxisId, Vec<usize>)> = Vec::new();
-
-    for member in &occ.members {
-        let path = occ.path_of(member);
-        let current = value_at(&trial.values, &path)?.clone();
-
-        if member.role == Role::GraphVertices {
-            if let (Value::Graph(graph), Some(Decl::Graph { edges, .. })) =
-                (&current, decl_at(&schema.items, &path))
-            {
-                if let Some(edge_axis) = schema.sizing_axis(edges) {
-                    induced.push((edge_axis, induced_edge_keep(graph, keep)));
-                }
-            }
-        }
-
-        let projected = project_member(&current, member.role, keep)?;
-        put(&mut trial, &path, projected);
-        written.push(path);
-    }
-
-    // Induction happens once, at the occurrence, and fans out to every member.
-    // No declaration recomputes a mask of its own.
-    for (axis, edge_keep) in induced {
-        let Some(target) = siblings.iter().find(|o| o.axis == axis) else {
-            continue;
-        };
-        debug_assert_eq!(
-            target.prefix, occ.prefix,
-            "induction escaped its block instantiation"
-        );
-        for member in &target.members {
-            let path = target.path_of(member);
-            if written.contains(&path) {
-                // The graph's own edge list was already projected alongside its
-                // vertices, because one `Value::Graph` holds both.
-                continue;
-            }
-            let current = value_at(&trial.values, &path)?.clone();
-            let projected = project_member(&current, member.role, &edge_keep)?;
-            put(&mut trial, &path, projected);
-            written.push(path);
-        }
-    }
-
-    // Downstream bookkeeping only: resync observes members that are already
-    // consistent, it does not decide which positions survived.
-    trial.resync();
-    Some(trial)
+    let state = propagate(data, occ, keep, all);
+    project_fixpoint(data, &state, all)
 }
 
 fn shrink_occurrence(
@@ -1484,12 +1617,9 @@ fn shrink_occurrence(
 ) -> bool {
     let schema = Rc::clone(&data.schema);
     let bounds = schema.axis_bounds(occ.axis);
-    // Occurrences an induced selection may reach: the same block instantiation.
-    let siblings: Vec<Occurrence> = data
-        .all_occurrences()
-        .into_iter()
-        .filter(|o| o.prefix == occ.prefix)
-        .collect();
+    // The solver addresses targets by (prefix, axis), so it needs the whole
+    // set; induction still only ever reaches the same block instantiation.
+    let all: Vec<Occurrence> = data.all_occurrences();
 
     // A tree may only shed leaves, so it runs a constrained sequence of
     // selections rather than one. Validation keeps it a sole member.
@@ -1510,7 +1640,7 @@ fn shrink_occurrence(
     }
 
     let positions: Vec<usize> = (0..extent).collect();
-    let mut test = |candidate: &[usize]| match project_occurrence(data, occ, candidate, &siblings) {
+    let mut test = |candidate: &[usize]| match project_occurrence(data, occ, candidate, &all) {
         Some(trial) => accept(&trial),
         None => false,
     };
@@ -1525,7 +1655,7 @@ fn shrink_occurrence(
     if kept.len() == extent {
         return false;
     }
-    match project_occurrence(data, occ, &kept, &siblings) {
+    match project_occurrence(data, occ, &kept, &all) {
         Some(next) => {
             *data = next;
             true
@@ -2517,6 +2647,113 @@ repeat T {
         assert_eq!(
             parse_input(&reduced.schema, &reduced.render()).unwrap(),
             reduced
+        );
+    }
+
+    /// The merge rule on its own, away from any graph. Two events narrow one
+    /// occurrence; the fixed point is their intersection and the order they
+    /// arrive in cannot change it.
+    ///
+    ///     domain 1111
+    ///     event  1011
+    ///     event  1101
+    ///     result 1001
+    #[test]
+    fn competing_events_converge_regardless_of_order() {
+        let domain = vec![0usize, 1, 2, 3];
+        let a = vec![0usize, 2, 3];
+        let b = vec![0usize, 1, 3];
+        let key = (vec![7usize], 0usize);
+
+        let run = |events: &[&Vec<usize>]| -> (Vec<usize>, usize) {
+            let mut state = Propagation {
+                masks: BTreeMap::new(),
+                updates: 0,
+            };
+            state.masks.insert(key.clone(), domain.clone());
+            for incoming in events {
+                state.narrow(key.clone(), incoming, &domain);
+            }
+            (state.masks[&key].clone(), state.updates)
+        };
+
+        let (forward, forward_updates) = run(&[&a, &b]);
+        let (backward, backward_updates) = run(&[&b, &a]);
+        assert_eq!(forward, vec![0, 3]);
+        assert_eq!(
+            forward, backward,
+            "the fixed point depends on arrival order"
+        );
+        assert_eq!(forward_updates, 2);
+        assert_eq!(backward_updates, 2);
+
+        // Re-delivering a mask that changes nothing must not count, and must
+        // not enqueue: that is what stops a cycle.
+        let mut state = Propagation {
+            masks: BTreeMap::new(),
+            updates: 0,
+        };
+        state.masks.insert(key.clone(), domain.clone());
+        assert!(state.narrow(key.clone(), &a, &domain));
+        assert!(!state.narrow(key.clone(), &a, &domain));
+        assert!(!state.narrow(key.clone(), &domain, &domain));
+        assert_eq!(state.updates, 1);
+    }
+
+    /// Two inducers, one target. Both graphs share the vertex axis *and* the
+    /// edge axis, so one vertex selection emits two induced edge masks and the
+    /// fixed point is their intersection.
+    #[test]
+    fn two_inducers_on_one_target_intersect() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E1[M] vertices N\n\
+                    graph E2[M] vertices N\n";
+        let data = build(text, "4 3\n1 2\n2 3\n3 4\n1 4\n1 3\n2 3\n");
+
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let vertex_occ = all
+            .iter()
+            .find(|o| o.members.iter().any(|m| m.role == Role::GraphVertices))
+            .expect("a vertex occurrence")
+            .clone();
+        assert_eq!(
+            vertex_occ.members.len(),
+            2,
+            "both graphs share the vertices"
+        );
+
+        // Keeping vertices 1, 2, 3 leaves edges {0,1} of E1 and {1,2} of E2.
+        let state = propagate(&data, &vertex_occ, &[0, 1, 2], &all);
+        let edge_axis = state
+            .masks
+            .iter()
+            .find(|((_, axis), _)| *axis != vertex_occ.axis)
+            .map(|(_, mask)| mask.clone())
+            .expect("the edge axis was narrowed");
+        assert_eq!(edge_axis, vec![1], "the fixed point is the intersection");
+
+        // Every successful narrowing strictly removes a position, so the count
+        // is bounded by the positions in play. A re-enqueue cycle would blow
+        // past this rather than hang.
+        let total: usize = all.iter().filter_map(|o| occurrence_extent(&data, o)).sum();
+        assert!(
+            state.updates <= total,
+            "{} updates over {total} positions",
+            state.updates
+        );
+
+        let projected = project_fixpoint(&data, &state, &all).expect("projects");
+        // N M, then E1's surviving edge, then E2's.
+        assert_eq!(ints(&projected.render()), vec![3, 1, 2, 3, 1, 3]);
+        assert_eq!(
+            parse_input(&projected.schema, &projected.render()).unwrap(),
+            projected
         );
     }
 

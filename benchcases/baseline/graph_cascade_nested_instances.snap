@@ -1,0 +1,15 @@
+# ccmin baseline snapshot for `graph_cascade_nested_instances`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 23
+final_tokens = 11
+oracle_calls = 75
+predicate_holds = true
+[input]
+2
+2 1
+1 2
+30
+2 1
+1 2
+61
