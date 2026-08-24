@@ -7,6 +7,7 @@
 //! would produce a reduced case that does not reproduce the real bug.
 
 use crate::proc::{self, CompareMode, RunOutput};
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -47,21 +48,36 @@ pub struct Failure {
     pub note: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CheckerConfig {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub scratch_dir: PathBuf,
+}
+
 pub struct Oracle {
     pub sol: PathBuf,
     pub brute: PathBuf,
     pub timeout: Duration,
     pub compare_mode: CompareMode,
+    pub checker: Option<CheckerConfig>,
     pub program_runs: usize,
 }
 
 impl Oracle {
-    pub fn new(sol: PathBuf, brute: PathBuf, timeout: Duration, compare_mode: CompareMode) -> Self {
+    pub fn new(
+        sol: PathBuf,
+        brute: PathBuf,
+        timeout: Duration,
+        compare_mode: CompareMode,
+        checker: Option<CheckerConfig>,
+    ) -> Self {
         Oracle {
             sol,
             brute,
             timeout,
             compare_mode,
+            checker,
             program_runs: 0,
         }
     }
@@ -74,24 +90,45 @@ impl Oracle {
         // Always run the reference too. For a solution crash/timeout to be a
         // useful counterexample, the reference must still accept the input.
         let brute = proc::run(&self.brute, &[], input, self.timeout)?;
-        Ok(classify(&sol, &brute, self.compare_mode))
+        if let Some(failure) = classify_process_failures(&sol, &brute) {
+            return Ok(Some(failure));
+        }
+
+        if let Some(checker) = &self.checker {
+            self.program_runs += 1;
+            return run_checker(checker, input, &sol, &brute, self.timeout);
+        }
+
+        Ok(classify_outputs(&sol, &brute, self.compare_mode))
     }
 
     /// The shrinking predicate: does this candidate reproduce the same failure?
-    pub fn preserves(&mut self, input: &str, target: FailKind) -> bool {
-        target != FailKind::BothFailed
-            && matches!(self.judge(input), Ok(Some(f)) if f.kind == target)
+    pub fn preserves(&mut self, input: &str, target: FailKind) -> io::Result<bool> {
+        if target == FailKind::BothFailed {
+            return Ok(false);
+        }
+        Ok(matches!(self.judge(input)?, Some(f) if f.kind == target))
     }
 
     /// Guard against flaky solutions (uninitialised memory, hash iteration
     /// order). Shrinking a nondeterministic failure chases ghosts for minutes
     /// and yields a reduced case that does not reproduce.
-    pub fn is_stable(&mut self, input: &str, target: FailKind, tries: usize) -> bool {
-        (0..tries).all(|_| self.preserves(input, target))
+    pub fn is_stable(&mut self, input: &str, target: FailKind, tries: usize) -> io::Result<bool> {
+        for _ in 0..tries {
+            if !self.preserves(input, target)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
+#[cfg(test)]
 fn classify(sol: &RunOutput, brute: &RunOutput, compare_mode: CompareMode) -> Option<Failure> {
+    classify_process_failures(sol, brute).or_else(|| classify_outputs(sol, brute, compare_mode))
+}
+
+fn classify_process_failures(sol: &RunOutput, brute: &RunOutput) -> Option<Failure> {
     let sol_failure = run_failure(
         sol,
         FailKind::SolOutputLimit,
@@ -128,13 +165,105 @@ fn classify(sol: &RunOutput, brute: &RunOutput, compare_mode: CompareMode) -> Op
             brute_output: brute.stdout.clone(),
             note: detail(kind, &brute.stderr),
         }),
-        (None, None) if proc::output_eq(&sol.stdout, &brute.stdout, compare_mode) => None,
-        (None, None) => Some(Failure {
-            kind: FailKind::WrongAnswer,
-            sol_output: proc::normalize(&sol.stdout),
-            brute_output: proc::normalize(&brute.stdout),
-            note: String::new(),
-        }),
+        (None, None) => None,
+    }
+}
+
+fn classify_outputs(
+    sol: &RunOutput,
+    brute: &RunOutput,
+    compare_mode: CompareMode,
+) -> Option<Failure> {
+    if proc::output_eq(&sol.stdout, &brute.stdout, compare_mode) {
+        None
+    } else {
+        Some(wrong_answer(sol, brute, String::new()))
+    }
+}
+
+fn run_checker(
+    checker: &CheckerConfig,
+    input: &str,
+    sol: &RunOutput,
+    brute: &RunOutput,
+    timeout: Duration,
+) -> io::Result<Option<Failure>> {
+    let input_path = checker.scratch_dir.join("checker-input.txt");
+    let actual_path = checker.scratch_dir.join("checker-actual.txt");
+    let expected_path = checker.scratch_dir.join("checker-expected.txt");
+    for (path, contents) in [
+        (&input_path, input),
+        (&actual_path, sol.stdout.as_str()),
+        (&expected_path, brute.stdout.as_str()),
+    ] {
+        std::fs::write(path, contents).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot write checker file {}: {e}", path.display()),
+            )
+        })?;
+    }
+
+    let mut args = checker.args.clone();
+    args.extend(
+        [&input_path, &actual_path, &expected_path]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    let output = proc::run(&checker.program, &args, "", timeout).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot run checker {}: {e}", checker.program.display()),
+        )
+    })?;
+
+    checker_outcome(&output, sol, brute)
+}
+
+fn checker_outcome(
+    output: &RunOutput,
+    sol: &RunOutput,
+    brute: &RunOutput,
+) -> io::Result<Option<Failure>> {
+    if output.output_limited {
+        return Err(checker_error("exceeded the output limit", output));
+    }
+    if output.timed_out {
+        return Err(checker_error("timed out", output));
+    }
+    match output.code {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(wrong_answer(sol, brute, checker_note(output)))),
+        Some(code) => Err(checker_error(&format!("exited with code {code}"), output)),
+        None => Err(checker_error("terminated without an exit code", output)),
+    }
+}
+
+fn wrong_answer(sol: &RunOutput, brute: &RunOutput, note: String) -> Failure {
+    Failure {
+        kind: FailKind::WrongAnswer,
+        sol_output: proc::normalize(&sol.stdout),
+        brute_output: proc::normalize(&brute.stdout),
+        note,
+    }
+}
+
+fn checker_error(reason: &str, output: &RunOutput) -> io::Error {
+    let note = checker_note(output);
+    let suffix = if note.is_empty() {
+        String::new()
+    } else {
+        format!(": {note}")
+    };
+    io::Error::other(format!("custom checker {reason}{suffix}"))
+}
+
+fn checker_note(output: &RunOutput) -> String {
+    let stderr = first_line(&output.stderr);
+    if stderr.is_empty() {
+        first_line(&output.stdout)
+    } else {
+        stderr
     }
 }
 
@@ -215,5 +344,34 @@ mod tests {
             FailKind::WrongAnswer
         );
         assert!(classify(&sol, &brute, CompareMode::Tokens).is_none());
+    }
+
+    #[test]
+    fn checker_exit_contract_distinguishes_wa_from_checker_errors() {
+        let sol = run(Some(0));
+        let brute = run(Some(0));
+
+        assert!(checker_outcome(&run(Some(0)), &sol, &brute)
+            .unwrap()
+            .is_none());
+
+        let mut rejected = run(Some(1));
+        rejected.stderr = "not optimal\nmore detail".into();
+        let failure = checker_outcome(&rejected, &sol, &brute).unwrap().unwrap();
+        assert_eq!(failure.kind, FailKind::WrongAnswer);
+        assert_eq!(failure.note, "not optimal");
+
+        let error = checker_outcome(&run(Some(2)), &sol, &brute).unwrap_err();
+        assert!(error.to_string().contains("exited with code 2"));
+    }
+
+    #[test]
+    fn checker_timeout_is_a_tool_error_not_a_preserved_failure() {
+        let sol = run(Some(0));
+        let brute = run(Some(0));
+        let mut checker = run(None);
+        checker.timed_out = true;
+        let error = checker_outcome(&checker, &sol, &brute).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 }

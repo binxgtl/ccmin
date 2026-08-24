@@ -89,6 +89,8 @@ ccmin -s solution.cpp -b slow.cpp -g generator.cpp -n 1000
     --n-index <INDEX>  length field in an array header (zero-based)
     --strict           disable heuristic extended-header detection
     --compare <MODE>   exact or tokens [default: exact]
+    --checker <PROG>   custom checker executable
+    --checker-arg <A>  checker argument (repeatable)
     --demo             run the built-in example
     --no-color         disable ANSI colour
 ```
@@ -159,6 +161,25 @@ whitespace while ignoring trailing whitespace on each line. Use
 `--compare tokens` for the common judge behaviour where every run of whitespace
 is just a separator, so `1  2` and `1 2` compare equal.
 
+For multiple-answer problems, use a custom checker instead of `--compare`:
+
+```bash
+ccmin --checker ./checker
+ccmin --checker python --checker-arg checker.py
+```
+
+The checker is launched without a shell. Any `--checker-arg` values come first,
+followed by three generated file paths:
+
+```text
+checker [ARGS...] <input> <actual-solution-output> <expected-brute-output>
+```
+
+Exit `0` accepts the output and exit `1` reports wrong answer. Any other exit,
+timeout or output-limit violation is a checker error: `ccmin` stops instead of
+treating it as a shrinkable failure. `--checker` and `--compare` are mutually
+exclusive.
+
 The result is a **small, locally reduced counterexample**, not a proof of the
 globally smallest possible input. Structural delta debugging and bounded value
 shrinking can stop at a local minimum.
@@ -190,9 +211,8 @@ is worse than no shrinker:
   shrink that changes *how* the outputs differ is still accepted.
 - **Single tokens are not shrunk.** A long string stays a long string; only
   whole tokens are removed.
-- **Custom checker problems are unsupported.** Token comparison handles
-  whitespace differences, but problems with multiple valid answers can still
-  report false failures.
+- **Interactive problems are unsupported.** Programs receive a complete input
+  on stdin and must terminate before their output can be checked.
 
 ## Zero dependencies
 

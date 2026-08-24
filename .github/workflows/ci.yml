@@ -48,3 +48,15 @@ jobs:
             --gen testdata/graph/gen.cpp \
             --iters 1 --no-save --no-color && code=0 || code=$?
           test "$code" -eq 1
+      - name: custom checker end-to-end
+        shell: bash
+        run: |
+          cargo run --release -- \
+            --shape array \
+            --sol testdata/checker/sol.cpp \
+            --brute testdata/checker/brute.cpp \
+            --gen testdata/checker/gen.cpp \
+            --checker python \
+            --checker-arg testdata/checker/checker.py \
+            --iters 1 --no-save --no-color && code=0 || code=$?
+          test "$code" -eq 1

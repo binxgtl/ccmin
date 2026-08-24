@@ -14,6 +14,7 @@ pub struct Shrinker<'a> {
     oracle: &'a mut Oracle,
     target: FailKind,
     on_step: &'a mut dyn FnMut(&Model),
+    error: Option<String>,
 }
 
 impl<'a> Shrinker<'a> {
@@ -26,18 +27,28 @@ impl<'a> Shrinker<'a> {
             oracle,
             target,
             on_step,
+            error: None,
         }
     }
 
     fn accept(&mut self, m: &Model) -> bool {
-        let ok = self.oracle.preserves(&m.render(), self.target);
+        if self.error.is_some() {
+            return false;
+        }
+        let ok = match self.oracle.preserves(&m.render(), self.target) {
+            Ok(ok) => ok,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        };
         if ok {
             (self.on_step)(m);
         }
         ok
     }
 
-    pub fn run(&mut self, start: &Model) -> Model {
+    pub fn run(&mut self, start: &Model) -> Result<Model, String> {
         let mut best = start.clone();
         // A handful of rounds is plenty; the passes converge fast and this
         // bounds pathological cases.
@@ -45,11 +56,14 @@ impl<'a> Shrinker<'a> {
             let before = best.clone();
             best = self.structural(&best);
             best = self.values(&best);
+            if let Some(error) = self.error.take() {
+                return Err(error);
+            }
             if best == before {
                 break;
             }
         }
-        best
+        Ok(best)
     }
 
     // ---- structural ------------------------------------------------------
@@ -363,5 +377,25 @@ mod tests {
     fn graph_ddmin_can_remove_the_final_edge() {
         let out = ddmin_allow_empty(&[42], |_| true);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn oracle_errors_abort_shrinking() {
+        let missing = std::path::PathBuf::from("__ccmin_definitely_missing_executable__");
+        let mut oracle = Oracle::new(
+            missing.clone(),
+            missing,
+            std::time::Duration::from_millis(10),
+            crate::proc::CompareMode::Exact,
+            None,
+        );
+        let mut on_step = |_: &Model| {};
+        let mut shrinker = Shrinker::new(&mut oracle, FailKind::WrongAnswer, &mut on_step);
+        let model = Model::Array(ArrayCase {
+            header: vec![2],
+            n_idx: 0,
+            arr: vec![1, 2],
+        });
+        assert!(shrinker.run(&model).is_err());
     }
 }

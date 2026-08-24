@@ -671,4 +671,93 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    #[test]
+    fn array_length_stays_synced_for_many_candidate_sizes() {
+        let case = ArrayCase {
+            header: vec![99, 6],
+            n_idx: 1,
+            arr: vec![10, 20, 30, 40, 50, 60],
+        };
+        for len in 0..=case.arr.len() {
+            let candidate = case.with_arr(case.arr[..len].to_vec());
+            assert_eq!(candidate.header[candidate.n_idx], len as i64);
+            let reparsed = parse_with(
+                &Model::Array(candidate.clone()).render(),
+                ParseOptions {
+                    shape: Shape::Array,
+                    n_index: Some(1),
+                    strict: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(reparsed, Model::Array(candidate));
+        }
+    }
+
+    #[test]
+    fn every_induced_graph_subset_has_compact_valid_endpoints() {
+        let graph = GraphCase {
+            n: 5,
+            edges: vec![
+                Edge { u: 1, v: 2 },
+                Edge { u: 2, v: 5 },
+                Edge { u: 4, v: 4 },
+                Edge { u: 5, v: 3 },
+            ],
+        };
+        for mask in 1usize..(1usize << graph.n) {
+            let kept: Vec<usize> = (1..=graph.n)
+                .filter(|vertex| mask & (1 << (vertex - 1)) != 0)
+                .collect();
+            let candidate = graph.induced(&kept);
+            assert_eq!(candidate.n, kept.len());
+            assert!(candidate
+                .edges
+                .iter()
+                .all(|edge| (1..=candidate.n).contains(&edge.u)
+                    && (1..=candidate.n).contains(&edge.v)));
+            let reparsed = parse_with(
+                &Model::Graph(candidate.clone()).render(),
+                ParseOptions {
+                    shape: Shape::Graph,
+                    ..ParseOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(reparsed, Model::Graph(candidate));
+        }
+    }
+
+    #[test]
+    fn pruning_any_original_leaf_subset_preserves_tree_invariant() {
+        let tree = GraphCase {
+            n: 6,
+            edges: vec![
+                Edge { u: 1, v: 2 },
+                Edge { u: 2, v: 3 },
+                Edge { u: 3, v: 4 },
+                Edge { u: 3, v: 5 },
+                Edge { u: 2, v: 6 },
+            ],
+        };
+        let leaves = tree.leaves();
+        let internal: Vec<usize> = (1..=tree.n)
+            .filter(|vertex| !leaves.contains(vertex))
+            .collect();
+        for mask in 0usize..(1usize << leaves.len()) {
+            let mut kept = internal.clone();
+            kept.extend(
+                leaves
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .map(|(_, vertex)| *vertex),
+            );
+            kept.sort_unstable();
+            let candidate = tree.induced(&kept);
+            assert!(is_tree(&candidate));
+            assert_eq!(candidate.edges.len(), candidate.n - 1);
+        }
+    }
 }

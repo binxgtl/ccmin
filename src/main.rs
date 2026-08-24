@@ -9,7 +9,7 @@ mod term;
 mod toolchain;
 
 use model::{Model, ParseOptions, Shape};
-use oracle::{FailKind, Oracle};
+use oracle::{CheckerConfig, FailKind, Oracle};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +30,9 @@ struct Args {
     n_index: Option<usize>,
     strict: bool,
     compare_mode: proc::CompareMode,
+    compare_explicit: bool,
+    checker: Option<PathBuf>,
+    checker_args: Vec<String>,
 }
 
 impl Default for Args {
@@ -48,6 +51,9 @@ impl Default for Args {
             n_index: None,
             strict: false,
             compare_mode: proc::CompareMode::Exact,
+            compare_explicit: false,
+            checker: None,
+            checker_args: Vec::new(),
         }
     }
 }
@@ -124,7 +130,12 @@ fn run() -> Result<bool, String> {
         term::green(&format!("done ({}ms)", t0.elapsed().as_millis()))
     );
 
-    let mut oracle = Oracle::new(sol, brute, args.timeout, args.compare_mode);
+    let checker = args.checker.clone().map(|program| CheckerConfig {
+        program,
+        args: args.checker_args.clone(),
+        scratch_dir: work.to_path_buf(),
+    });
+    let mut oracle = Oracle::new(sol, brute, args.timeout, args.compare_mode, checker);
 
     // --- 2. stress --------------------------------------------------------
     println!(
@@ -213,7 +224,10 @@ fn run() -> Result<bool, String> {
         return Ok(true);
     }
 
-    if !oracle.is_stable(&input, failure.kind, 3) {
+    if !oracle
+        .is_stable(&input, failure.kind, 3)
+        .map_err(|e| format!("rechecking counterexample: {e}"))?
+    {
         println!(
             "\n{} the failure is not reproducible across runs.\n{}",
             term::yellow("warning:"),
@@ -246,6 +260,7 @@ fn run() -> Result<bool, String> {
         };
         let mut sh = shrink::Shrinker::new(&mut oracle, failure.kind, &mut on_step);
         sh.run(&parsed)
+            .map_err(|e| format!("shrinking counterexample: {e}"))?
     };
     print!("{}", term::clear_line());
 
@@ -308,6 +323,9 @@ fn report(
                 term::red("actual   (sol):  "),
                 failure.sol_output.trim_end()
             );
+            if !failure.note.is_empty() {
+                println!("{} {}", term::dim("checker:"), failure.note);
+            }
         }
         _ => {
             println!("{} {}", term::red("failure:"), failure.kind.describe());
@@ -457,6 +475,7 @@ fn parse_args() -> Result<Args, String> {
             "--strict" => a.strict = true,
             "--compare" => {
                 let value = next(&mut i, "--compare")?;
+                a.compare_explicit = true;
                 a.compare_mode = match value.as_str() {
                     "exact" => proc::CompareMode::Exact,
                     "tokens" => proc::CompareMode::Tokens,
@@ -467,6 +486,8 @@ fn parse_args() -> Result<Args, String> {
                     }
                 };
             }
+            "--checker" => a.checker = Some(next(&mut i, "--checker")?.into()),
+            "--checker-arg" => a.checker_args.push(next(&mut i, "--checker-arg")?),
             "--shape" => {
                 let value = next(&mut i, "--shape")?;
                 a.shape = match value.as_str() {
@@ -512,6 +533,12 @@ fn parse_args() -> Result<Args, String> {
     if a.n_index.is_some() && a.shape != Shape::Array {
         return Err("--n-index requires --shape array".into());
     }
+    if a.checker.is_none() && !a.checker_args.is_empty() {
+        return Err("--checker-arg requires --checker".into());
+    }
+    if a.checker.is_some() && a.compare_explicit {
+        return Err("--checker and --compare are mutually exclusive".into());
+    }
     Ok(a)
 }
 
@@ -539,6 +566,8 @@ OPTIONS:
         --n-index <INDEX>  length field in an array header (zero-based)
         --strict           disable heuristic extended-header detection
         --compare <MODE>   exact or tokens             [default: exact]
+        --checker <PROG>   custom checker executable
+        --checker-arg <A>  argument before checker file paths (repeatable)
         --no-save          do not write the reduced input to disk
         --demo             run a built-in worked example
         --no-color         disable ANSI colour
