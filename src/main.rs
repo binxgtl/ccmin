@@ -25,10 +25,11 @@ struct Args {
     out: PathBuf,
     save: bool,
     demo: bool,
-    no_color: bool,
     shape: Shape,
     n_index: Option<usize>,
-    strict: bool,
+    guess_header: bool,
+    cpp_standard: String,
+    cxxflags: Vec<String>,
     compare_mode: proc::CompareMode,
     compare_explicit: bool,
     checker: Option<PathBuf>,
@@ -46,10 +47,11 @@ impl Default for Args {
             out: "minimal.in".into(),
             save: true,
             demo: false,
-            no_color: false,
             shape: Shape::Auto,
             n_index: None,
-            strict: false,
+            guess_header: false,
+            cpp_standard: "gnu++20".into(),
+            cxxflags: Vec::new(),
             compare_mode: proc::CompareMode::Exact,
             compare_explicit: false,
             checker: None,
@@ -59,6 +61,9 @@ impl Default for Args {
 }
 
 fn main() {
+    // Initialise before argument parsing so even usage errors respect TTY and
+    // --no-color. `run` reuses this state.
+    term::init(std::env::args_os().any(|arg| arg == "--no-color"));
     match run() {
         Ok(found_bug) => std::process::exit(if found_bug { 1 } else { 0 }),
         Err(e) => {
@@ -70,7 +75,6 @@ fn main() {
 
 fn run() -> Result<bool, String> {
     let args = parse_args()?;
-    term::init(args.no_color);
 
     // Build artifacts go to a temp directory: ccmin never writes to your
     // working tree except for the final reduced input.
@@ -116,6 +120,10 @@ fn run() -> Result<bool, String> {
     );
     flush();
 
+    let compile_options = toolchain::CompileOptions {
+        standard: args.cpp_standard.clone(),
+        flags: args.cxxflags.clone(),
+    };
     let exes = cc.compile_all(
         &[
             ("sol".into(), sol_src),
@@ -123,6 +131,7 @@ fn run() -> Result<bool, String> {
             ("gen".into(), gen_src),
         ],
         work,
+        &compile_options,
     )?;
     let (sol, brute, gen) = (exes[0].clone(), exes[1].clone(), exes[2].clone());
     println!(
@@ -181,7 +190,7 @@ fn run() -> Result<bool, String> {
         ParseOptions {
             shape: args.shape,
             n_index: args.n_index,
-            strict: args.strict,
+            guess_header: args.guess_header,
         },
     )?;
     println!(
@@ -203,13 +212,13 @@ fn run() -> Result<bool, String> {
         };
         println!("      {}", term::yellow(&format!("note: {reason}")));
     } else if args.shape == Shape::Auto
-        && !args.strict
+        && args.guess_header
         && matches!(&parsed, Model::Array(c) if c.header.len() > 1)
     {
         println!(
             "      {}",
             term::yellow(
-                "note: array shape was inferred from an extended header; use --shape array to confirm it, --shape raw to disable it, or --strict to reject heuristic matches"
+                "note: array shape was inferred from an extended header; use --shape array to confirm it or omit --guess-header to keep auto detection conservative"
             )
         );
     }
@@ -220,7 +229,7 @@ fn run() -> Result<bool, String> {
             "\n{} both programs failed on the generated input; the brute force must exit successfully before crash reduction is safe. Shrinking was skipped.",
             term::yellow("warning:")
         );
-        report(&input, &failure, &args, None)?;
+        report(&input, &failure, &args, false)?;
         return Ok(true);
     }
 
@@ -237,7 +246,7 @@ fn run() -> Result<bool, String> {
                  chase ghosts, so it was skipped."
             )
         );
-        report(&input, &failure, &args, None)?;
+        report(&input, &failure, &args, false)?;
         return Ok(true);
     }
 
@@ -265,6 +274,17 @@ fn run() -> Result<bool, String> {
     print!("{}", term::clear_line());
 
     let text = reduced.render();
+    if !oracle
+        .is_stable(&text, failure.kind, 3)
+        .map_err(|e| format!("rechecking reduced counterexample: {e}"))?
+    {
+        println!(
+            "\n{} the reduced input did not reproduce the same failure three times; the original stable counterexample will be reported instead.",
+            term::yellow("warning:")
+        );
+        report(&input, &failure, &args, false)?;
+        return Ok(true);
+    }
     let final_failure = oracle
         .judge(&text)
         .map_err(|e| format!("verifying reduced case: {e}"))?
@@ -296,7 +316,7 @@ fn run() -> Result<bool, String> {
         oracle.program_runs
     );
 
-    report(&text, &final_failure, &args, Some(t2.elapsed()))?;
+    report(&text, &final_failure, &args, true)?;
     Ok(true)
 }
 
@@ -304,10 +324,17 @@ fn report(
     input: &str,
     failure: &oracle::Failure,
     args: &Args,
-    _elapsed: Option<Duration>,
+    reduced: bool,
 ) -> Result<(), String> {
     println!("\n{}", term::rule());
-    println!("{}", term::bold("REDUCED FAILING INPUT"));
+    println!(
+        "{}",
+        term::bold(if reduced {
+            "REDUCED FAILING INPUT"
+        } else {
+            "FAILING INPUT"
+        })
+    );
     println!("{}", input.trim_end());
     println!("{}", term::rule());
 
@@ -470,9 +497,14 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "--demo" => a.demo = true,
-            "--no-color" => a.no_color = true,
+            "--no-color" => {}
             "--no-save" => a.save = false,
-            "--strict" => a.strict = true,
+            // Kept as a backwards-compatible no-op: conservative auto mode is
+            // now the default.
+            "--strict" => a.guess_header = false,
+            "--guess-header" => a.guess_header = true,
+            "--std" => a.cpp_standard = next(&mut i, "--std")?,
+            "--cxxflag" => a.cxxflags.push(next(&mut i, "--cxxflag")?),
             "--compare" => {
                 let value = next(&mut i, "--compare")?;
                 a.compare_explicit = true;
@@ -530,6 +562,11 @@ fn parse_args() -> Result<Args, String> {
         }
         i += 1;
     }
+    let cli_cxxflags = std::mem::take(&mut a.cxxflags);
+    if let Ok(flags) = std::env::var("CXXFLAGS") {
+        a.cxxflags.extend(toolchain::split_flags(&flags)?);
+    }
+    a.cxxflags.extend(cli_cxxflags);
     if a.n_index.is_some() && a.shape != Shape::Array {
         return Err("--n-index requires --shape array".into());
     }
@@ -564,7 +601,9 @@ OPTIONS:
         --shape <SHAPE>    auto, array, multitest, tree, graph, or raw
                           [default: auto]
         --n-index <INDEX>  length field in an array header (zero-based)
-        --strict           disable heuristic extended-header detection
+        --guess-header     heuristically detect 2-3 field array headers
+        --std <STD>        C++ language standard       [default: gnu++20]
+        --cxxflag <FLAG>   extra compiler argument (repeatable)
         --compare <MODE>   exact or tokens             [default: exact]
         --checker <PROG>   custom checker executable
         --checker-arg <A>  argument before checker file paths (repeatable)

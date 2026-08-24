@@ -144,9 +144,10 @@ pub enum Shape {
 pub struct ParseOptions {
     pub shape: Shape,
     pub n_index: Option<usize>,
-    /// In auto mode, accept only the conservative `N + N integers` and standard
-    /// `T` test case forms. Extended headers require an explicit override.
-    pub strict: bool,
+    /// In auto mode, also try two- and three-field array headers. This is
+    /// deliberately opt-in because a coincidental count can corrupt a format
+    /// that is not actually an array.
+    pub guess_header: bool,
 }
 
 impl Model {
@@ -318,8 +319,9 @@ pub fn parse_with(text: &str, options: ParseOptions) -> Result<Model, String> {
         return Ok(Model::MultiTest(tests));
     }
 
-    // Then headers like `N K` / `N M K`, with N in any header position.
-    if !options.strict {
+    // Optionally try headers like `N K` / `N M K`, with N in any header
+    // position. Conservative auto detection is the default.
+    if options.guess_header {
         for h in 2..=3usize {
             for i in 0..h {
                 if let Some(c) = try_array(&ints, h, i) {
@@ -500,7 +502,14 @@ mod tests {
 
     #[test]
     fn parses_header_with_extra_scalar() {
-        let m = parse("5 2\n1 2 3 4 5\n");
+        let m = parse_with(
+            "5 2\n1 2 3 4 5\n",
+            ParseOptions {
+                guess_header: true,
+                ..ParseOptions::default()
+            },
+        )
+        .unwrap();
         match m {
             Model::Array(c) => {
                 assert_eq!(c.header, vec![5, 2]);
@@ -539,19 +548,23 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_rejects_heuristic_extended_header() {
-        let loose = parse("2 99\n1 2\n");
-        assert!(matches!(loose, Model::Array(_)));
+    fn extended_header_guessing_is_opt_in() {
+        let conservative = parse("2 99\n1 2\n");
+        assert!(conservative.is_raw());
 
-        let strict = parse_with(
+        let guessed = parse_with(
             "2 99\n1 2\n",
             ParseOptions {
-                strict: true,
+                guess_header: true,
                 ..ParseOptions::default()
             },
         )
         .unwrap();
-        assert!(strict.is_raw());
+        assert!(matches!(guessed, Model::Array(_)));
+
+        // This graph-like input used to false-positive as an array because the
+        // first of three guessed header values happened to equal the tail.
+        assert!(parse("3 2\n1 2\n2 3\n").is_raw());
     }
 
     #[test]
@@ -561,7 +574,7 @@ mod tests {
             ParseOptions {
                 shape: Shape::Array,
                 n_index: Some(1),
-                strict: false,
+                guess_header: false,
             },
         )
         .unwrap();
@@ -687,7 +700,7 @@ mod tests {
                 ParseOptions {
                     shape: Shape::Array,
                     n_index: Some(1),
-                    strict: false,
+                    guess_header: false,
                 },
             )
             .unwrap();

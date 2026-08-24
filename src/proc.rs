@@ -10,6 +10,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 /// A runaway contestant program must not be able to consume unbounded memory.
 /// The limit applies independently to stdout and stderr.
 pub const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -44,12 +47,18 @@ pub fn run(
 ) -> std::io::Result<RunOutput> {
     let start = Instant::now();
 
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // Descendants inherit this process group. On Windows the equivalent job
+    // object is attached immediately after spawn.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    let process_tree = ProcessTree::attach(&child);
 
     // Feed stdin from its own thread. If the child exits without reading all
     // of its input we get EPIPE here, which is expected and ignored.
@@ -92,14 +101,10 @@ pub fn run(
             }
             None => {
                 if output_limited.load(Ordering::Relaxed) {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     hit_output_limit = true;
                     break;
                 }
                 if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     timed_out = true;
                     break;
                 }
@@ -113,6 +118,12 @@ pub fn run(
         }
     }
 
+    // Also clean up descendants after a normal parent exit. A background child
+    // can otherwise keep the captured pipes open and survive the test run.
+    process_tree.terminate();
+    let _ = child.kill();
+    let _ = child.wait();
+
     let grace = Duration::from_millis(500);
     let stdout = rx_out.recv_timeout(grace).unwrap_or_default();
     let stderr = rx_err.recv_timeout(grace).unwrap_or_default();
@@ -125,6 +136,167 @@ pub fn run(
         timed_out,
         output_limited: hit_output_limit,
     })
+}
+
+#[cfg(unix)]
+struct ProcessTree {
+    group: i32,
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn attach(child: &std::process::Child) -> Self {
+        Self {
+            group: child.id() as i32,
+        }
+    }
+
+    fn terminate(&self) {
+        const SIGKILL: i32 = 9;
+        extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        // A negative pid targets the entire process group.
+        unsafe {
+            let _ = kill(-self.group, SIGKILL);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: Option<windows_job::Job>,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn attach(child: &std::process::Child) -> Self {
+        // Job assignment may be rejected by an unusually restrictive parent
+        // job. Parent-only termination remains as a safe fallback in that case.
+        Self {
+            job: windows_job::Job::attach(child).ok(),
+        }
+    }
+
+    fn terminate(&self) {
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+impl ProcessTree {
+    fn attach(_: &std::process::Child) -> Self {
+        Self
+    }
+
+    fn terminate(&self) {}
+}
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+mod windows_job {
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+
+    type Handle = *mut c_void;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+    #[repr(C)]
+    struct BasicLimitInformation {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: u32,
+        MinimumWorkingSetSize: usize,
+        MaximumWorkingSetSize: usize,
+        ActiveProcessLimit: u32,
+        Affinity: usize,
+        PriorityClass: u32,
+        SchedulingClass: u32,
+    }
+
+    #[repr(C)]
+    struct IoCounters {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    }
+
+    #[repr(C)]
+    struct ExtendedLimitInformation {
+        BasicLimitInformation: BasicLimitInformation,
+        IoInfo: IoCounters,
+        ProcessMemoryLimit: usize,
+        JobMemoryLimit: usize,
+        PeakProcessMemoryUsed: usize,
+        PeakJobMemoryUsed: usize,
+    }
+
+    extern "system" {
+        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(
+            job: Handle,
+            class: i32,
+            info: *const c_void,
+            length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    pub struct Job(Handle);
+
+    impl Job {
+        pub fn attach(child: &std::process::Child) -> io::Result<Self> {
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+
+                let mut limits: ExtendedLimitInformation = zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    handle,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    &limits as *const _ as *const c_void,
+                    size_of::<ExtendedLimitInformation>() as u32,
+                ) == 0
+                    || AssignProcessToJobObject(handle, child.as_raw_handle() as Handle) == 0
+                {
+                    let error = io::Error::last_os_error();
+                    CloseHandle(handle);
+                    return Err(error);
+                }
+                Ok(Self(handle))
+            }
+        }
+
+        pub fn terminate(&self) {
+            unsafe {
+                let _ = TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 fn read_capped(src: &mut impl Read, cap: usize, limited: &AtomicBool) -> Vec<u8> {

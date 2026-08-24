@@ -27,6 +27,12 @@ pub struct Compiler {
     pub vcvars: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CompileOptions {
+    pub standard: String,
+    pub flags: Vec<String>,
+}
+
 impl Compiler {
     pub fn label(&self) -> String {
         let name = match self.kind {
@@ -53,21 +59,29 @@ impl Compiler {
         &self,
         targets: &[(String, PathBuf)],
         out_dir: &Path,
+        options: &CompileOptions,
     ) -> Result<Vec<PathBuf>, String> {
         match self.kind {
             Kind::Gnu | Kind::Clang => targets
                 .iter()
-                .map(|(role, src)| self.compile_gnu(role, src, out_dir))
+                .map(|(role, src)| self.compile_gnu(role, src, out_dir, options))
                 .collect(),
-            Kind::Msvc => self.compile_msvc(targets, out_dir),
+            Kind::Msvc => self.compile_msvc(targets, out_dir, options),
         }
     }
 
-    fn compile_gnu(&self, role: &str, src: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+    fn compile_gnu(
+        &self,
+        role: &str,
+        src: &Path,
+        out_dir: &Path,
+        options: &CompileOptions,
+    ) -> Result<PathBuf, String> {
         let exe = self.exe_for(role, out_dir);
         let output = Command::new(&self.path)
-            .arg("-std=c++20")
+            .arg(format!("-std={}", options.standard))
             .arg("-O2")
+            .args(&options.flags)
             .arg("-o")
             .arg(&exe)
             .arg(src)
@@ -88,6 +102,7 @@ impl Compiler {
         &self,
         targets: &[(String, PathBuf)],
         out_dir: &Path,
+        options: &CompileOptions,
     ) -> Result<Vec<PathBuf>, String> {
         // Passing a compound command to `cmd /C` as one argument runs afoul of
         // cmd's quote-stripping rules and silently loses the diagnostics, so we
@@ -98,6 +113,13 @@ impl Compiler {
         }
 
         let mut exes = Vec::with_capacity(targets.len());
+        let standard = msvc_standard(&options.standard);
+        let extra_flags = options
+            .flags
+            .iter()
+            .map(|flag| batch_arg(flag))
+            .collect::<Vec<_>>()
+            .join(" ");
         for (role, src) in targets {
             let exe = self.exe_for(role, out_dir);
             // Name the object file explicitly. Passing a *directory* would need
@@ -105,8 +127,10 @@ impl Compiler {
             // cl parse a mangled path.
             let obj = out_dir.join(format!("ccmin-{role}.obj"));
             body.push_str(&format!(
-                "\"{}\" /nologo /std:c++20 /EHsc /O2 \"{}\" /Fe:\"{}\" /Fo:\"{}\"\r\n",
+                "\"{}\" /nologo /std:{} /EHsc /O2 {} \"{}\" /Fe:\"{}\" /Fo:\"{}\"\r\n",
                 self.path.display(),
+                standard,
+                extra_flags,
                 src.display(),
                 exe.display(),
                 obj.display()
@@ -154,6 +178,21 @@ fn diagnostics(stdout: &[u8], stderr: &[u8], code: Option<i32>) -> String {
 }
 
 pub fn detect() -> Result<Compiler, String> {
+    if let Some(value) = std::env::var_os("CXX").filter(|value| !value.is_empty()) {
+        let requested = PathBuf::from(value);
+        let path = if requested.components().count() > 1 || requested.is_absolute() {
+            requested.is_file().then_some(requested.clone())
+        } else {
+            which(&requested.to_string_lossy())
+        }
+        .ok_or_else(|| format!("CXX compiler not found: {}", requested.display()))?;
+        return Ok(Compiler {
+            kind: kind_from_name(&path),
+            path,
+            vcvars: None,
+        });
+    }
+
     for (name, kind) in [
         ("g++", Kind::Gnu),
         ("clang++", Kind::Clang),
@@ -174,6 +213,67 @@ pub fn detect() -> Result<Compiler, String> {
     }
 
     Err(no_compiler_help())
+}
+
+fn kind_from_name(path: &Path) -> Kind {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name == "cl" || name == "cl.exe" || name.contains("clang-cl") {
+        Kind::Msvc
+    } else if name.contains("clang") {
+        Kind::Clang
+    } else {
+        Kind::Gnu
+    }
+}
+
+fn msvc_standard(standard: &str) -> String {
+    let standard = standard.strip_prefix("gnu++").unwrap_or(standard);
+    let standard = standard.strip_prefix("c++").unwrap_or(standard);
+    if standard == "23" || standard == "26" {
+        "c++latest".into()
+    } else {
+        format!("c++{standard}")
+    }
+}
+
+fn batch_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Split CXXFLAGS without invoking a shell. Quotes group whitespace and are
+/// removed; backslashes are otherwise preserved so Windows paths still work.
+pub fn split_flags(value: &str) -> Result<Vec<String>, String> {
+    let mut flags = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(q) if ch == '\\' && chars.peek() == Some(&q) => {
+                current.push(chars.next().expect("peeked character exists"));
+            }
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    flags.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return Err("CXXFLAGS contains an unterminated quote".into());
+    }
+    if !current.is_empty() {
+        flags.push(current);
+    }
+    Ok(flags)
 }
 
 fn no_compiler_help() -> String {
@@ -280,5 +380,21 @@ mod tests {
         assert!(compiler
             .exe_for("sol", out)
             .ends_with(format!("ccmin-sol{}", std::env::consts::EXE_SUFFIX)));
+    }
+
+    #[test]
+    fn cxxflags_support_quoted_arguments() {
+        assert_eq!(
+            split_flags("-DLOCAL -I\"include files\" '-DNAME=hello world'").unwrap(),
+            vec!["-DLOCAL", "-Iinclude files", "-DNAME=hello world"]
+        );
+        assert!(split_flags("-DNAME=\"unfinished").is_err());
+    }
+
+    #[test]
+    fn maps_gnu_standard_to_msvc() {
+        assert_eq!(msvc_standard("gnu++20"), "c++20");
+        assert_eq!(msvc_standard("c++17"), "c++17");
+        assert_eq!(msvc_standard("gnu++23"), "c++latest");
     }
 }

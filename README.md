@@ -87,7 +87,9 @@ ccmin -s solution.cpp -b slow.cpp -g generator.cpp -n 1000
     --no-save          do not write minimal.in
     --shape <SHAPE>    auto, array, multitest, tree, graph, or raw
     --n-index <INDEX>  length field in an array header (zero-based)
-    --strict           disable heuristic extended-header detection
+    --guess-header     heuristically detect 2-3 field array headers
+    --std <STD>        C++ standard [default: gnu++20]
+    --cxxflag <FLAG>   extra compiler argument (repeatable)
     --compare <MODE>   exact or tokens [default: exact]
     --checker <PROG>   custom checker executable
     --checker-arg <A>  checker argument (repeatable)
@@ -120,10 +122,11 @@ shapes:
 - unweighted tree: `N` followed by `N - 1` one-based edges
 - unweighted graph: `N M` followed by `M` one-based edges
 
-Auto-detection is convenient but cannot prove a problem's schema. In
-particular, extended headers are inferred when one of their first three values
-happens to equal the remaining token count. `ccmin` warns when it makes this
-heuristic match. Override it when you know the format:
+Auto-detection is conservative by default: it recognises only the unambiguous
+`N + N integers` and standard multi-test forms. It does not guess tree or graph
+formats, nor headers such as `N K`, because a coincidental count could make an
+unrelated format look like an array. Override the shape when you know it, or
+explicitly opt into the extended-header heuristic:
 
 ```bash
 ccmin --shape array                 # confirm an array model
@@ -132,7 +135,7 @@ ccmin --shape multitest             # T blocks of N + N integers
 ccmin --shape tree                  # N, then N-1 edges
 ccmin --shape graph                 # N M, then M edges
 ccmin --shape raw                   # never update a length field
-ccmin --strict                      # auto-detect only simple N / T forms
+ccmin --guess-header                # also guess 2-3 field array headers
 ```
 
 Tree and graph shapes are explicit-only: auto mode never selects these models,
@@ -148,10 +151,11 @@ Two further guards:
   problem's constraints, and the smaller case would not reproduce the real bug.
   Both programs are always run: a solution crash or timeout is retained only
   while the brute force still exits successfully.
-- **Flaky failures are detected.** The counterexample must reproduce three
-  times before shrinking starts. Nondeterministic solutions — uninitialised
-  memory, `unordered_map` iteration order — otherwise send the shrinker chasing
-  ghosts and yield a reduced case that does not fail when you run it yourself.
+- **Flaky failures are detected.** Both the original counterexample and the
+  final reduced input must reproduce three times. Nondeterminism in the
+  solution, brute force or custom checker otherwise sends the shrinker chasing
+  ghosts. If final verification fails, `ccmin` reports and saves the original
+  stable input instead of presenting an unreliable reduction.
 
 Anything `ccmin` cannot classify still shrinks at the token level, but it says
 so, because in that mode the guarantee above does not hold.
@@ -181,8 +185,24 @@ treating it as a shrinkable failure. `--checker` and `--compare` are mutually
 exclusive.
 
 The result is a **small, locally reduced counterexample**, not a proof of the
-globally smallest possible input. Structural delta debugging and bounded value
-shrinking can stop at a local minimum.
+globally smallest possible input. Structural delta debugging can stop at a
+local minimum. Numeric values use boundary search toward zero, so an `i64`
+threshold normally takes at most about 63 predicate checks rather than a fixed
+number of halving steps.
+
+## Compiler configuration
+
+GNU and Clang builds default to `-std=gnu++20 -O2`; MSVC receives the closest
+`/std:` equivalent. Choose a dialect and repeat extra flags as needed:
+
+```bash
+ccmin --std gnu++17 --cxxflag -DLOCAL --cxxflag -Iinclude
+```
+
+The conventional `CXX` and `CXXFLAGS` environment variables are also honoured.
+`CXX` names one compiler executable (it is not evaluated by a shell), while
+quoted groups in `CXXFLAGS` are kept as a single argument. CLI `--cxxflag`
+values are appended after `CXXFLAGS`.
 
 ## Windows works without a developer prompt
 
@@ -222,9 +242,11 @@ place to inherit a supply chain. Everything here is `std`, including the
 Windows console handling and the process timeouts.
 
 Contestant stdout and stderr are each capped at 16 MiB. Exceeding that cap is
-reported as an output-limit failure. `ccmin` is not a sandbox: the compiler,
-generator, solution and brute-force binaries run with your normal user
-permissions, so do not use it for untrusted code.
+reported as an output-limit failure. On timeout, output limit, or normal parent
+exit, descendants are cleaned up through a Unix process group or Windows Job
+Object so they cannot survive while holding the capture pipes open. `ccmin` is
+still not a sandbox: the compiler, generator, solution and brute-force binaries
+run with your normal user permissions, so do not use it for untrusted code.
 
 The only file it writes to your working directory is `minimal.in`, and
 `--no-save` turns that off. Build artifacts go to a temp directory.

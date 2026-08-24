@@ -6,6 +6,14 @@ on:
   pull_request:
 
 jobs:
+  msrv:
+    name: Rust 1.74 (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.74
+      - run: cargo check --locked --all-targets
+
   test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

@@ -50,9 +50,9 @@ impl<'a> Shrinker<'a> {
 
     pub fn run(&mut self, start: &Model) -> Result<Model, String> {
         let mut best = start.clone();
-        // A handful of rounds is plenty; the passes converge fast and this
-        // bounds pathological cases.
-        for _ in 0..4 {
+        // Structural and value passes can unlock one another. Keep a generous
+        // safety bound, while still stopping immediately at a fixpoint.
+        for _ in 0..16 {
             let before = best.clone();
             best = self.structural(&best);
             best = self.values(&best);
@@ -201,13 +201,14 @@ impl<'a> Shrinker<'a> {
                     if i == n_idx {
                         continue;
                     }
-                    for cand in toward_zero(case.header[i]) {
+                    let original = case.header[i];
+                    let candidate = shrink_value(original, |cand| {
                         let mut next = case.clone();
                         next.header[i] = cand;
-                        if self.accept(&Model::Array(next.clone())) {
-                            case = next;
-                            break;
-                        }
+                        self.accept(&Model::Array(next))
+                    });
+                    if candidate != original {
+                        case.header[i] = candidate;
                     }
                 }
                 Model::Array(case)
@@ -281,41 +282,78 @@ fn shrink_ints(vals: &[i64], mut accept: impl FnMut(&[i64]) -> bool) -> Vec<i64>
     let mut cur = vals.to_vec();
     let mut improved = true;
     let mut rounds = 0;
-    while improved && rounds < 8 {
+    while improved && rounds < 16 {
         improved = false;
         rounds += 1;
         for i in 0..cur.len() {
-            for cand in toward_zero(cur[i]) {
+            let original = cur[i];
+            let candidate = shrink_value(original, |cand| {
                 let mut next = cur.clone();
                 next[i] = cand;
-                if accept(&next) {
-                    cur = next;
-                    improved = true;
-                    break;
-                }
+                accept(&next)
+            });
+            if candidate != original {
+                cur[i] = candidate;
+                improved = true;
             }
         }
     }
     cur
 }
 
-/// Candidate replacements for `x`, strictly smaller in magnitude, simplest
-/// first. Sign is preserved by the `±1` step so a negative value that matters
-/// stays negative.
-fn toward_zero(x: i64) -> Vec<i64> {
-    let mut out = Vec::new();
+/// Find the smallest accepted magnitude between zero and `x`. The predicate is
+/// expected to have a boundary along that interval, which is the common shape
+/// of numeric bugs (`x >= limit`, overflow thresholds, negative bounds). The
+/// returned value is always one that was actually accepted.
+fn shrink_value(x: i64, mut accept: impl FnMut(i64) -> bool) -> i64 {
     if x == 0 {
-        return out;
+        return x;
     }
+    if accept(0) {
+        return 0;
+    }
+
     let magnitude = x.unsigned_abs();
-    out.push(0);
-    if magnitude > 1 {
-        out.push(x.signum());
-        out.push(x / 2);
+    if magnitude == 1 {
+        return x;
     }
-    out.retain(|c| c.unsigned_abs() < magnitude);
-    out.dedup();
-    out
+    if accept(x.signum()) {
+        return x.signum();
+    }
+
+    let negative = x < 0;
+    let mut low = 2u64;
+    let mut high = magnitude;
+    let mut best = x;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = signed_magnitude(mid, negative);
+        if accept(candidate) {
+            best = candidate;
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    if low < magnitude {
+        let candidate = signed_magnitude(low, negative);
+        if accept(candidate) {
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn signed_magnitude(magnitude: u64, negative: bool) -> i64 {
+    if negative {
+        if magnitude == 1u64 << 63 {
+            i64::MIN
+        } else {
+            -(magnitude as i64)
+        }
+    } else {
+        magnitude as i64
+    }
 }
 
 #[cfg(test)]
@@ -340,30 +378,20 @@ mod tests {
     }
 
     #[test]
-    fn toward_zero_is_strictly_smaller() {
-        for x in [
-            i64::MIN,
-            -1_000_000_000,
-            -7,
-            -1,
-            1,
-            7,
-            1_000_000_000,
-            i64::MAX,
-        ] {
-            for c in toward_zero(x) {
-                assert!(
-                    c.unsigned_abs() < x.unsigned_abs(),
-                    "{c} not smaller than {x}"
-                );
-            }
-        }
-        assert!(toward_zero(0).is_empty());
+    fn boundary_search_reaches_large_threshold_in_logarithmic_calls() {
+        let mut calls = 0;
+        let out = shrink_value(1_000_000_000_000_000_000, |candidate| {
+            calls += 1;
+            candidate >= 1_000_000_000
+        });
+        assert_eq!(out, 1_000_000_000);
+        assert!(calls <= 66, "used {calls} predicate calls");
     }
 
     #[test]
-    fn toward_zero_handles_i64_min_without_overflow() {
-        assert_eq!(toward_zero(i64::MIN), vec![0, -1, i64::MIN / 2]);
+    fn boundary_search_handles_i64_min_without_overflow() {
+        let out = shrink_value(i64::MIN, |candidate| candidate <= -1_000_000_000);
+        assert_eq!(out, -1_000_000_000);
     }
 
     #[test]

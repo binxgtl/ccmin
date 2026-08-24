@@ -1,15 +1,16 @@
 //! Minimal ANSI styling. No dependencies; colour is disabled when the
 //! `NO_COLOR` environment variable is set or `--no-color` was passed.
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub fn init(force_off: bool) {
     #[allow(unused_mut)]
-    let mut on = !force_off && std::env::var_os("NO_COLOR").is_none();
-    // On Windows this doubles as an isatty check: GetConsoleMode fails when
-    // stdout is a pipe or a file, and escape codes would just be litter.
+    let mut on =
+        !force_off && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+    // Windows consoles additionally need virtual terminal processing enabled.
     #[cfg(windows)]
     if on {
         on = enable_vt();
