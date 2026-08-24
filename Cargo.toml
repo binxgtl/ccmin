@@ -7,7 +7,7 @@ description = "Find a failing test for your solution, then shrink it to a small 
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/binxgtl/ccmin"
-keywords = ["competitive-programming", "testing", "shrinking", "delta-debugging", "cpp"]
+keywords = ["competitive-coding", "testing", "shrinking", "delta-debugging", "cpp"]
 categories = ["command-line-utilities", "development-tools::testing"]
 
 # No dependencies. This is deliberate: ccmin runs untrusted-adjacent build
