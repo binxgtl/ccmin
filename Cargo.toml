@@ -1,0 +1,21 @@
+[package]
+name = "ccmin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Find a failing test for your solution, then shrink it to the smallest input that still fails."
+license = "MIT"
+readme = "README.md"
+keywords = ["competitive-programming", "testing", "shrinking", "delta-debugging", "cpp"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+# No dependencies. This is deliberate: ccmin runs untrusted-adjacent build
+# toolchains on a developer's machine, and a zero-dependency binary is
+# trivially auditable.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
