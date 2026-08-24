@@ -94,3 +94,13 @@ jobs:
           grep -qx '0' unconstrained.txt
           grep -qx '500000' constrained.txt
           ! grep -qx '0' constrained.txt
+      # A typo in a schema must not cost a compile and a full stress run first.
+      - name: schema errors are reported before compiling
+        shell: bash
+        run: |
+          printf 'int N in 1..10\nwidget W\n' > bad.schema
+          cargo run --release -- --schema bad.schema --no-color > schema-error.txt 2>&1 && code=0 || code=$?
+          cat schema-error.txt
+          test "$code" -eq 2
+          grep -q 'unknown declaration' schema-error.txt
+          ! grep -q 'compiling with' schema-error.txt

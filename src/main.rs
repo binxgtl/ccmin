@@ -82,6 +82,18 @@ fn main() {
 fn run() -> Result<bool, String> {
     let args = parse_args()?;
 
+    // Read the schema before doing any work. It is only needed once a
+    // counterexample exists, but a typo in it should not cost a compile and a
+    // full stress run before being reported.
+    let declared = match &args.schema_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read schema {}: {e}", path.display()))?;
+            Some(schema::parse_schema(&text).map_err(|e| format!("{}: {e}", path.display()))?)
+        }
+        None => None,
+    };
+
     // Build artifacts go to a temp directory: ccmin never writes to your
     // working tree except for the final reduced input.
     let work_dir = TempWorkDir::new()?;
@@ -191,14 +203,6 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     };
 
-    let declared = match &args.schema_path {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("cannot read schema {}: {e}", path.display()))?;
-            Some(schema::parse_schema(&text).map_err(|e| format!("{}: {e}", path.display()))?)
-        }
-        None => None,
-    };
     let parsed = model::parse_with(
         &input,
         ParseOptions {
@@ -595,8 +599,10 @@ fn parse_args() -> Result<Args, String> {
         // A schema states the grammar outright, so every inference knob is
         // not merely redundant but contradictory.
         if a.shape != Shape::Auto {
-            return Err("--schema and --shape are mutually exclusive: a schema already                         states the grammar"
-                .into());
+            return Err(
+                "--schema and --shape are mutually exclusive: a schema already states the grammar"
+                    .into(),
+            );
         }
         if a.guess_header {
             return Err("--guess-header has no meaning with --schema: nothing is guessed".into());
