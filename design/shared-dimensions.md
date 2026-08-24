@@ -1,12 +1,14 @@
 # Shared dimensions — design note for v0.5
 
-Status: proposal, revision 4. No code written. Design closed — the next step
-is code, starting with benchcases against v0.4 (§10).
+Status: proposal, revision 5. **Design closed.** The next step is code:
+benchcases freezing v0.4 (§10).
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
-count-shrink propagation and where independence lives. Revision 4 fixes the two
-places revision 3 was still inconsistent with its own model. What each revision
-got wrong is kept in §13, §14 and §15 rather than folded in silently.
+count-shrink propagation and where independence lives. Revision 4 fixed two
+places revision 3 contradicted its own model. Revision 5 closes the cascade
+fixpoint over cardinality events — a scheduling bug, not an architectural one.
+What each revision got wrong is kept in §13 to §16 rather than folded in
+silently.
 
 Three sentences the implementation has to keep true throughout:
 
@@ -14,7 +16,8 @@ Three sentences the implementation has to keep true throughout:
 > An Axis never owns cardinality.
 > A Relation never increases a keep-set.**
 
-Every correction across four revisions has been a violation of one of them.
+Every architectural correction across five revisions has been a violation of
+one of them.
 
 The model in one line:
 
@@ -226,32 +229,63 @@ enqueues can exceed it.
 
 Model it as a classic monotone dataflow analysis instead:
 
+Cardinality requirements are **events in the same queue**, not a pass that runs
+after it drains. Satisfying one shrinks an axis, and that shrink can induce
+relations, kill reference holders and lower a further count — so a post-pass
+would leave the fixpoint open:
+
+```text
+axis B shrinks to meet a cardinality
+  -> relation induces on axis C
+  -> a reference holder dies
+  -> another count drops
+  -> more axes must meet a new cardinality
+  -> ...
 ```
-state: keep[axis] -> bitmask over original positions
+
+Two event kinds, both monotone:
+
+```text
+state:
+    keep[axis]    bitmask over original positions   -- only ever &=
+    target[count] upper bound on extent             -- only ever decreases
 
 apply(axis, mask):
-    worklist = { axis }
-    keep[axis] &= mask
-    while worklist not empty:
-        a = pop(worklist)
-        for each subscriber of a:
-            induced = positions of other axes invalidated by a's current keep
-            for (a2, m2) in induced:
-                before = keep[a2]
-                keep[a2] &= m2
-                if keep[a2] != before:      # enqueue only on an actual shrink
-                    push(a2)
-    for each count c:
-        extent(c) = min |keep[a]| over axes a of c
-        for each axis a of c: RequireCardinality(a, extent(c))
-            # each axis picks its own positions; no mask crosses axes
-    relabel every Index reference through the retained-position mapping
+    push RestrictAxis(axis, mask)
+
+    while queue not empty:
+        RestrictAxis(a, m):
+            before = keep[a]
+            keep[a] &= m
+            if keep[a] == before: continue          # no change, no work
+            for (a2, m2) in induced_by(a):          # references and relations
+                push RestrictAxis(a2, m2)
+            c = count(a)
+            if |keep[a]| < target[c]:
+                push RequireCardinality(c, |keep[a]|)
+
+        RequireCardinality(c, k):
+            if k >= target[c]: continue             # already at least this tight
+            target[c] = k
+            for each axis a of c where |keep[a]| > k:
+                push RestrictAxis(a, a.select_to(k))
+                                                    # a picks its OWN positions
+
+    # only once the queue is empty
+    for each count c: extent(c) = target[c]
+    relabel every Index reference through its own axis's retained mapping
+    validate every relation and constraint
 ```
 
-Termination: the state is a finite product lattice of bitmasks, every update is
-`&=` so it descends monotonically, and an axis is enqueued only when its mask
-strictly shrinks. Bounded by total positions, and now actually provable rather
-than asserted.
+`a.select_to(k)` is the axis's own canonical selection. No mask ever crosses an
+axis boundary, which is invariant 14.
+
+Termination: the state is the product of a finite lattice of bitmasks and a
+vector of integer upper bounds. `RestrictAxis` only intersects;
+`RequireCardinality` only lowers a target; both skip immediately when nothing
+changes. Every effective event strictly descends in that product, so the queue
+drains in at most `sum(original extents) + sum(initial targets)` effective
+steps.
 
 ### Count shrinking across several axes
 
@@ -712,3 +746,26 @@ and then not propagating it through the rest of the document.
 Both were violations of the three sentences at the top of this document, which
 is why they are now stated there. The second in particular is why the summary
 leads with *a Count never carries identity*.
+
+---
+
+## 16. What revision 4 got wrong
+
+One thing, and unlike the earlier revisions it was an algorithm bug rather than
+a modelling one — the concepts were right, the scheduling was not.
+
+**`RequireCardinality` ran after the worklist drained.** Satisfying a
+cardinality shrinks an axis, and that shrink can induce relations, kill
+reference holders and lower a further count. All of that needed to be back on
+the queue, so the fixpoint was not closed and the pass could terminate in a
+state that still had pending work.
+
+Fixed in §5 by making cardinality requirements events in the same queue as axis
+restrictions. The termination argument came out stronger: the state is now
+explicitly the product of a bitmask lattice and a vector of integer upper
+bounds, with every effective event strictly descending in it.
+
+Worth noting for the implementation: this class of bug does not show up in a
+model review, only in reading the pseudocode as an operational semantics. The
+same is likely true of whatever is still wrong here, which is the argument for
+stopping the design and writing benchcases.
