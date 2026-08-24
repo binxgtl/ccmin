@@ -1,5 +1,7 @@
 //! ccmin -- find a failing test, then shrink it until it is small enough to read.
 
+#[cfg(test)]
+mod benchcases;
 mod demo;
 mod model;
 mod oracle;

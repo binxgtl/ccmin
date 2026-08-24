@@ -1,0 +1,10 @@
+# ccmin baseline snapshot for `bounded_numeric`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 6
+final_tokens = 2
+oracle_calls = 69
+predicate_holds = true
+[input]
+1
+500000

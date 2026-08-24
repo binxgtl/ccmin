@@ -1,0 +1,10 @@
+# ccmin baseline snapshot for `array_numeric_boundary`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 41
+final_tokens = 2
+oracle_calls = 68
+predicate_holds = true
+[input]
+1
+500000

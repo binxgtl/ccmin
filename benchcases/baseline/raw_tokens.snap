@@ -1,0 +1,9 @@
+# ccmin baseline snapshot for `raw_tokens`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 8
+final_tokens = 1
+oracle_calls = 2
+predicate_holds = true
+[input]
+A

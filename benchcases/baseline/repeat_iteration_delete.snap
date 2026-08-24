@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `repeat_iteration_delete`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 10
+final_tokens = 3
+oracle_calls = 11
+predicate_holds = true
+[input]
+1
+1
+-1

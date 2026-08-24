@@ -1,0 +1,10 @@
+# ccmin baseline snapshot for `matrix_col_delete`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 8
+final_tokens = 3
+oracle_calls = 11
+predicate_holds = true
+[input]
+1 1
+7

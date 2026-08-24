@@ -1,0 +1,10 @@
+# ccmin baseline snapshot for `graph_isolated_vertices`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 4
+final_tokens = 4
+oracle_calls = 12
+predicate_holds = true
+[input]
+2 1
+1 2

@@ -1,0 +1,9 @@
+# ccmin baseline snapshot for `tree_prune_multi_round`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 17
+final_tokens = 1
+oracle_calls = 6
+predicate_holds = true
+[input]
+1

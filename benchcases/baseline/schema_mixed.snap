@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `schema_mixed`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 11
+final_tokens = 4
+oracle_calls = 12
+predicate_holds = true
+[input]
+0 1
+1
+-1
