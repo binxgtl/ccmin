@@ -6,7 +6,7 @@
 //! input became malformed or left the problem's constraints, and accepting it
 //! would produce a reduced case that does not reproduce the real bug.
 
-use crate::proc::{self, RunOutput};
+use crate::proc::{self, CompareMode, RunOutput};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -51,15 +51,17 @@ pub struct Oracle {
     pub sol: PathBuf,
     pub brute: PathBuf,
     pub timeout: Duration,
+    pub compare_mode: CompareMode,
     pub program_runs: usize,
 }
 
 impl Oracle {
-    pub fn new(sol: PathBuf, brute: PathBuf, timeout: Duration) -> Self {
+    pub fn new(sol: PathBuf, brute: PathBuf, timeout: Duration, compare_mode: CompareMode) -> Self {
         Oracle {
             sol,
             brute,
             timeout,
+            compare_mode,
             program_runs: 0,
         }
     }
@@ -72,7 +74,7 @@ impl Oracle {
         // Always run the reference too. For a solution crash/timeout to be a
         // useful counterexample, the reference must still accept the input.
         let brute = proc::run(&self.brute, &[], input, self.timeout)?;
-        Ok(classify(&sol, &brute))
+        Ok(classify(&sol, &brute, self.compare_mode))
     }
 
     /// The shrinking predicate: does this candidate reproduce the same failure?
@@ -89,7 +91,7 @@ impl Oracle {
     }
 }
 
-fn classify(sol: &RunOutput, brute: &RunOutput) -> Option<Failure> {
+fn classify(sol: &RunOutput, brute: &RunOutput, compare_mode: CompareMode) -> Option<Failure> {
     let sol_failure = run_failure(
         sol,
         FailKind::SolOutputLimit,
@@ -126,7 +128,7 @@ fn classify(sol: &RunOutput, brute: &RunOutput) -> Option<Failure> {
             brute_output: brute.stdout.clone(),
             note: detail(kind, &brute.stderr),
         }),
-        (None, None) if proc::output_eq(&sol.stdout, &brute.stdout) => None,
+        (None, None) if proc::output_eq(&sol.stdout, &brute.stdout, compare_mode) => None,
         (None, None) => Some(Failure {
             kind: FailKind::WrongAnswer,
             sol_output: proc::normalize(&sol.stdout),
@@ -186,10 +188,10 @@ mod tests {
 
     #[test]
     fn solution_crash_requires_clean_brute() {
-        let failure = classify(&run(Some(1)), &run(Some(0))).unwrap();
+        let failure = classify(&run(Some(1)), &run(Some(0)), CompareMode::Exact).unwrap();
         assert_eq!(failure.kind, FailKind::SolCrashed);
 
-        let failure = classify(&run(Some(1)), &run(Some(1))).unwrap();
+        let failure = classify(&run(Some(1)), &run(Some(1)), CompareMode::Exact).unwrap();
         assert_eq!(failure.kind, FailKind::BothFailed);
     }
 
@@ -197,7 +199,21 @@ mod tests {
     fn output_limit_has_its_own_failure_kind() {
         let mut sol = run(None);
         sol.output_limited = true;
-        let failure = classify(&sol, &run(Some(0))).unwrap();
+        let failure = classify(&sol, &run(Some(0)), CompareMode::Exact).unwrap();
         assert_eq!(failure.kind, FailKind::SolOutputLimit);
+    }
+
+    #[test]
+    fn configured_comparison_mode_controls_wrong_answer() {
+        let mut sol = run(Some(0));
+        sol.stdout = "1  2\n".into();
+        let mut brute = run(Some(0));
+        brute.stdout = "1 2\n".into();
+
+        assert_eq!(
+            classify(&sol, &brute, CompareMode::Exact).unwrap().kind,
+            FailKind::WrongAnswer
+        );
+        assert!(classify(&sol, &brute, CompareMode::Tokens).is_none());
     }
 }

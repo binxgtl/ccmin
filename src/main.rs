@@ -29,6 +29,7 @@ struct Args {
     shape: Shape,
     n_index: Option<usize>,
     strict: bool,
+    compare_mode: proc::CompareMode,
 }
 
 impl Default for Args {
@@ -46,6 +47,7 @@ impl Default for Args {
             shape: Shape::Auto,
             n_index: None,
             strict: false,
+            compare_mode: proc::CompareMode::Exact,
         }
     }
 }
@@ -122,7 +124,7 @@ fn run() -> Result<bool, String> {
         term::green(&format!("done ({}ms)", t0.elapsed().as_millis()))
     );
 
-    let mut oracle = Oracle::new(sol, brute, args.timeout);
+    let mut oracle = Oracle::new(sol, brute, args.timeout, args.compare_mode);
 
     // --- 2. stress --------------------------------------------------------
     println!(
@@ -453,6 +455,18 @@ fn parse_args() -> Result<Args, String> {
             "--no-color" => a.no_color = true,
             "--no-save" => a.save = false,
             "--strict" => a.strict = true,
+            "--compare" => {
+                let value = next(&mut i, "--compare")?;
+                a.compare_mode = match value.as_str() {
+                    "exact" => proc::CompareMode::Exact,
+                    "tokens" => proc::CompareMode::Tokens,
+                    _ => {
+                        return Err(format!(
+                            "unknown comparison mode `{value}` (expected exact or tokens)"
+                        ))
+                    }
+                };
+            }
             "--shape" => {
                 let value = next(&mut i, "--shape")?;
                 a.shape = match value.as_str() {
@@ -524,6 +538,7 @@ OPTIONS:
                           [default: auto]
         --n-index <INDEX>  length field in an array header (zero-based)
         --strict           disable heuristic extended-header detection
+        --compare <MODE>   exact or tokens             [default: exact]
         --no-save          do not write the reduced input to disk
         --demo             run a built-in worked example
         --no-color         disable ANSI colour

@@ -88,6 +88,7 @@ ccmin -s solution.cpp -b slow.cpp -g generator.cpp -n 1000
     --shape <SHAPE>    auto, array, multitest, tree, graph, or raw
     --n-index <INDEX>  length field in an array header (zero-based)
     --strict           disable heuristic extended-header detection
+    --compare <MODE>   exact or tokens [default: exact]
     --demo             run the built-in example
     --no-color         disable ANSI colour
 ```
@@ -153,6 +154,11 @@ Two further guards:
 Anything `ccmin` cannot classify still shrinks at the token level, but it says
 so, because in that mode the guarantee above does not hold.
 
+Output comparison defaults to `--compare exact`, which preserves internal
+whitespace while ignoring trailing whitespace on each line. Use
+`--compare tokens` for the common judge behaviour where every run of whitespace
+is just a separator, so `1  2` and `1 2` compare equal.
+
 The result is a **small, locally reduced counterexample**, not a proof of the
 globally smallest possible input. Structural delta debugging and bounded value
 shrinking can stop at a local minimum.
@@ -184,8 +190,8 @@ is worse than no shrinker:
   shrink that changes *how* the outputs differ is still accepted.
 - **Single tokens are not shrunk.** A long string stays a long string; only
   whole tokens are removed.
-- **Checker-based problems are unsupported.** Outputs are compared literally
-  (modulo trailing whitespace), so problems with multiple valid answers will
+- **Custom checker problems are unsupported.** Token comparison handles
+  whitespace differences, but problems with multiple valid answers can still
   report false failures.
 
 ## Zero dependencies

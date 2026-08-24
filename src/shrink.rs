@@ -293,12 +293,13 @@ fn toward_zero(x: i64) -> Vec<i64> {
     if x == 0 {
         return out;
     }
+    let magnitude = x.unsigned_abs();
     out.push(0);
-    if x.abs() > 1 {
+    if magnitude > 1 {
         out.push(x.signum());
         out.push(x / 2);
     }
-    out.retain(|c| c.abs() < x.abs());
+    out.retain(|c| c.unsigned_abs() < magnitude);
     out.dedup();
     out
 }
@@ -326,12 +327,29 @@ mod tests {
 
     #[test]
     fn toward_zero_is_strictly_smaller() {
-        for x in [-1_000_000_000i64, -7, -1, 1, 7, 1_000_000_000] {
+        for x in [
+            i64::MIN,
+            -1_000_000_000,
+            -7,
+            -1,
+            1,
+            7,
+            1_000_000_000,
+            i64::MAX,
+        ] {
             for c in toward_zero(x) {
-                assert!(c.abs() < x.abs(), "{c} not smaller than {x}");
+                assert!(
+                    c.unsigned_abs() < x.unsigned_abs(),
+                    "{c} not smaller than {x}"
+                );
             }
         }
         assert!(toward_zero(0).is_empty());
+    }
+
+    #[test]
+    fn toward_zero_handles_i64_min_without_overflow() {
+        assert_eq!(toward_zero(i64::MIN), vec![0, -1, i64::MIN / 2]);
     }
 
     #[test]

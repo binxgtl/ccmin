@@ -14,6 +14,13 @@ use std::time::{Duration, Instant};
 /// The limit applies independently to stdout and stderr.
 pub const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompareMode {
+    #[default]
+    Exact,
+    Tokens,
+}
+
 pub struct RunOutput {
     pub stdout: String,
     pub stderr: String,
@@ -139,10 +146,14 @@ fn read_capped(src: &mut impl Read, cap: usize, limited: &AtomicBool) -> Vec<u8>
     out
 }
 
-/// Compare two program outputs the way a judge would: ignore trailing
-/// whitespace on each line and any number of trailing blank lines.
-pub fn output_eq(a: &str, b: &str) -> bool {
-    normalize(a) == normalize(b)
+pub fn output_eq(a: &str, b: &str, mode: CompareMode) -> bool {
+    match mode {
+        // Preserve ccmin's original behaviour: ignore line-ending whitespace
+        // and trailing blank lines, but keep internal whitespace significant.
+        CompareMode::Exact => normalize(a) == normalize(b),
+        // Typical token-based CP judging: all runs of whitespace are separators.
+        CompareMode::Tokens => a.split_whitespace().eq(b.split_whitespace()),
+    }
 }
 
 pub fn normalize(s: &str) -> String {
@@ -174,5 +185,17 @@ mod tests {
         let out = read_capped(&mut src, 16, &limited);
         assert_eq!(out.len(), 16);
         assert!(!limited.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn exact_comparison_preserves_internal_whitespace() {
+        assert!(!output_eq("1  2\n", "1 2\n", CompareMode::Exact));
+        assert!(output_eq("1 2  \n\n", "1 2\n", CompareMode::Exact));
+    }
+
+    #[test]
+    fn token_comparison_ignores_all_whitespace_runs() {
+        assert!(output_eq(" 1  2\n3\t4 \n", "1\n2 3 4", CompareMode::Tokens));
+        assert!(!output_eq("1 2", "1 3", CompareMode::Tokens));
     }
 }
