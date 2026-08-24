@@ -1,0 +1,15 @@
+# ccmin baseline snapshot for `nested_repeat_occurrences`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 15
+final_tokens = 7
+oracle_calls = 44
+predicate_holds = true
+[input]
+2
+1
+1
+12
+1
+1
+20

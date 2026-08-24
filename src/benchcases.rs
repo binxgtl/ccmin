@@ -36,6 +36,8 @@ enum Pred {
     Always,
     AnyNegative,
     ContainsValue(i64),
+    /// Several values at once, so a case can pin two different occurrences.
+    ContainsAll(&'static [i64]),
     ContainsToken(&'static str),
     /// A floor, so structural reduction has something to stop against.
     MinTokens(usize),
@@ -54,6 +56,10 @@ impl Pred {
             Pred::Always => true,
             Pred::AnyNegative => ints().iter().any(|v| *v < 0),
             Pred::ContainsValue(v) => ints().contains(v),
+            Pred::ContainsAll(vs) => {
+                let present = ints();
+                vs.iter().all(|v| present.contains(v))
+            }
             Pred::ContainsToken(t) => text.split_whitespace().any(|x| x == *t),
             Pred::MinTokens(k) => text.split_whitespace().count() >= *k,
             Pred::AnyAtLeast(v) => ints().iter().any(|x| x >= v),
@@ -208,6 +214,40 @@ fn cases() -> Vec<Case> {
         Shape::Auto,
         "77 3\n2\n5 6\n3\n-7 8 9\n1\n4\n".into(),
         Pred::AnyNegative,
+    );
+
+    // --- nested repeats --------------------------------------------------
+    // The inner block axis occurs once per outer instance. The predicate needs
+    // outer 0's second inner iteration and outer 1's first, so the two
+    // occurrences of one AxisId must select different positions.
+    add(
+        "nested_repeat_occurrences",
+        Some(
+            "int T in 1..5
+repeat T {
+  int G in 1..5
+  repeat G {
+                 int N in 1..5
+    array A[N] in -100..100
+  }
+}
+",
+        ),
+        Shape::Auto,
+        "2
+2
+1
+10
+3
+11 12 13
+2
+3
+20 21 22
+1
+23
+"
+        .into(),
+        Pred::ContainsAll(&[12, 20]),
     );
 
     // --- the unstructured fallback --------------------------------------
@@ -448,6 +488,7 @@ fn corpus_covers_every_reduction_path() {
         "graph_vertex_cascade",
         "bounded_numeric",
         "schema_mixed",
+        "nested_repeat_occurrences",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

@@ -1183,6 +1183,45 @@ impl SchemaData {
     }
 }
 
+/// One selection on one axis occurrence.
+///
+/// Every structural reduction is the same two steps: choose which of the
+/// occurrence's `0..extent` positions survive, then project the data onto the
+/// survivors. Splitting them is what lets a selection later fan out to several
+/// collections, and to cascade into other axes.
+///
+/// The keep-mask is a **local**. It is computed for the occurrence named by
+/// `path` and applied there, so two instantiations of one declaration select
+/// independently and nothing keyed by `AxisId` is ever written. That is the
+/// property revision 6 exists to protect; see
+/// `two_instances_of_one_axis_reach_different_masks`.
+///
+/// Returns the projected value when the selection shrank, `None` otherwise.
+fn select_at(
+    data: &SchemaData,
+    path: &[usize],
+    extent: usize,
+    min: usize,
+    allow_empty: bool,
+    project: &dyn Fn(&[usize]) -> Value,
+    accept: &mut dyn FnMut(&SchemaData) -> bool,
+) -> Option<Value> {
+    if extent <= min {
+        return None;
+    }
+    let positions: Vec<usize> = (0..extent).collect();
+    let mut test = |candidate: &[usize]| try_put(data, path, project(candidate), accept);
+    let kept = if allow_empty {
+        ddmin_floor(&positions, min, &mut test)
+    } else {
+        ddmin_min_len(&positions, min, &mut test)
+    };
+    // ddmin only ever removes, so the mask can only shrink -- which is what
+    // keeps the fixpoint argument in section 5 of the design note valid.
+    debug_assert!(kept.len() <= extent);
+    (kept.len() != extent).then(|| project(&kept))
+}
+
 fn shrink_site(
     data: &mut SchemaData,
     path: &[usize],
@@ -1202,46 +1241,53 @@ fn shrink_site(
             let Some(bounds) = schema.sizing_bounds(len) else {
                 return false;
             };
-            let min = bounds.min_count();
-            if arr.len() <= min {
-                return false;
+            let project = |keep: &[usize]| Value::Array(keep.iter().map(|&i| arr[i]).collect());
+            let extent = arr.len();
+            match select_at(
+                data,
+                path,
+                extent,
+                bounds.min_count(),
+                true,
+                &project,
+                accept,
+            ) {
+                Some(reduced) => commit(data, path, reduced, true),
+                None => false,
             }
-            let reduced = ddmin_floor(&arr, min, |cand| {
-                try_put(data, path, Value::Array(cand.to_vec()), accept)
-            });
-            let shrank = reduced.len() != arr.len();
-            commit(data, path, Value::Array(reduced), shrank)
         }
 
         (Decl::Matrix { rows, cols, .. }, Value::Matrix(grid)) => {
+            // Two axes index one collection, so it takes two selections.
             if let Some(bounds) = schema.sizing_bounds(rows) {
-                let min = bounds.min_count();
-                if grid.len() > min {
-                    let reduced = ddmin_floor(&grid, min, |cand| {
-                        try_put(data, path, Value::Matrix(cand.to_vec()), accept)
-                    });
-                    if reduced.len() != grid.len() {
-                        return commit(data, path, Value::Matrix(reduced), true);
-                    }
+                let project =
+                    |keep: &[usize]| Value::Matrix(keep.iter().map(|&i| grid[i].clone()).collect());
+                let extent = grid.len();
+                if let Some(reduced) = select_at(
+                    data,
+                    path,
+                    extent,
+                    bounds.min_count(),
+                    true,
+                    &project,
+                    accept,
+                ) {
+                    return commit(data, path, reduced, true);
                 }
             }
             if let Some(bounds) = schema.sizing_bounds(cols) {
-                let min = bounds.min_count();
-                let width = grid.first().map_or(0, |r| r.len());
-                if width > min {
-                    let columns: Vec<usize> = (0..width).collect();
-                    let kept = ddmin_floor(&columns, min, |cand| {
-                        try_put(
-                            data,
-                            path,
-                            Value::Matrix(select_columns(&grid, cand)),
-                            accept,
-                        )
-                    });
-                    if kept.len() != width {
-                        let narrowed = select_columns(&grid, &kept);
-                        return commit(data, path, Value::Matrix(narrowed), true);
-                    }
+                let project = |keep: &[usize]| Value::Matrix(select_columns(&grid, keep));
+                let extent = grid.first().map_or(0, |r| r.len());
+                if let Some(reduced) = select_at(
+                    data,
+                    path,
+                    extent,
+                    bounds.min_count(),
+                    true,
+                    &project,
+                    accept,
+                ) {
+                    return commit(data, path, reduced, true);
                 }
             }
             false
@@ -1249,32 +1295,41 @@ fn shrink_site(
 
         (Decl::Graph { edges, verts, .. }, Value::Graph(graph)) => {
             if let Some(bounds) = schema.sizing_bounds(edges) {
-                let min = bounds.min_count();
-                if graph.edges.len() > min {
-                    let reduced = ddmin_floor(&graph.edges, min, |cand| {
-                        try_put(
-                            data,
-                            path,
-                            Value::Graph(graph.with_edges(cand.to_vec())),
-                            accept,
-                        )
-                    });
-                    if reduced.len() != graph.edges.len() {
-                        let thinned = graph.with_edges(reduced);
-                        return commit(data, path, Value::Graph(thinned), true);
-                    }
+                let project = |keep: &[usize]| {
+                    Value::Graph(graph.with_edges(keep.iter().map(|&i| graph.edges[i]).collect()))
+                };
+                let extent = graph.edges.len();
+                if let Some(reduced) = select_at(
+                    data,
+                    path,
+                    extent,
+                    bounds.min_count(),
+                    true,
+                    &project,
+                    accept,
+                ) {
+                    return commit(data, path, reduced, true);
                 }
             }
             if let Some(bounds) = schema.sizing_bounds(verts) {
-                let min = bounds.min_count().max(1);
-                if graph.n > min {
-                    let vertices: Vec<usize> = (1..=graph.n).collect();
-                    let kept = ddmin_min_len(&vertices, min, |cand| {
-                        try_put(data, path, Value::Graph(graph.induced(cand)), accept)
-                    });
-                    if kept.len() != graph.n {
-                        return commit(data, path, Value::Graph(graph.induced(&kept)), true);
-                    }
+                // The one cascade that already exists: dropping a vertex also
+                // drops every edge with a removed endpoint and relabels the
+                // survivors. `induced` is that projection.
+                let project = |keep: &[usize]| {
+                    let labels: Vec<usize> = keep.iter().map(|&i| i + 1).collect();
+                    Value::Graph(graph.induced(&labels))
+                };
+                let extent = graph.n;
+                if let Some(reduced) = select_at(
+                    data,
+                    path,
+                    extent,
+                    bounds.min_count().max(1),
+                    false,
+                    &project,
+                    accept,
+                ) {
+                    return commit(data, path, reduced, true);
                 }
             }
             false
@@ -1285,6 +1340,9 @@ fn shrink_site(
                 return false;
             };
             let min = bounds.min_count().max(1);
+            // A constrained selection: only leaves may be dropped, or the
+            // result stops being a tree. Pruning exposes new leaves, so this is
+            // a sequence of selections rather than one.
             let mut current = tree.clone();
             let mut changed = false;
             loop {
@@ -1300,20 +1358,19 @@ fn shrink_site(
                 let base = current.clone();
                 // Keep enough leaves to satisfy the declared vertex floor.
                 let min_leaves = min.saturating_sub(internal.len());
-                let kept_leaves = ddmin_min_len(&leaves, min_leaves, |candidate| {
+                let project = |keep: &[usize]| {
                     let mut kept = internal.clone();
-                    kept.extend_from_slice(candidate);
+                    kept.extend(keep.iter().map(|&i| leaves[i]));
                     kept.sort_unstable();
-                    !kept.is_empty()
-                        && try_put(data, path, Value::Graph(base.induced(&kept)), accept)
-                });
-                if kept_leaves.len() == leaves.len() {
+                    Value::Graph(base.induced(&kept))
+                };
+                let extent = leaves.len();
+                let Some(Value::Graph(next)) =
+                    select_at(data, path, extent, min_leaves, false, &project, accept)
+                else {
                     break;
-                }
-                let mut kept = internal;
-                kept.extend(kept_leaves);
-                kept.sort_unstable();
-                current = base.induced(&kept);
+                };
+                current = next;
                 changed = true;
             }
             commit(data, path, Value::Graph(current), changed)
@@ -1323,15 +1380,21 @@ fn shrink_site(
             let Some(bounds) = schema.sizing_bounds(count) else {
                 return false;
             };
-            let min = bounds.min_count();
-            if iters.len() <= min {
-                return false;
+            let project =
+                |keep: &[usize]| Value::Repeat(keep.iter().map(|&i| iters[i].clone()).collect());
+            let extent = iters.len();
+            match select_at(
+                data,
+                path,
+                extent,
+                bounds.min_count(),
+                true,
+                &project,
+                accept,
+            ) {
+                Some(reduced) => commit(data, path, reduced, true),
+                None => false,
             }
-            let reduced = ddmin_floor(&iters, min, |cand| {
-                try_put(data, path, Value::Repeat(cand.to_vec()), accept)
-            });
-            let shrank = reduced.len() != iters.len();
-            commit(data, path, Value::Repeat(reduced), shrank)
         }
 
         _ => false,
@@ -1803,6 +1866,129 @@ repeat T {
                 "iteration {i}: count {n} does not match its own array"
             );
         }
+        assert_eq!(
+            parse_input(&reduced.schema, &reduced.render()).unwrap(),
+            reduced
+        );
+    }
+
+    /// Every count, at every nesting depth, must match the length of the data
+    /// in *its own* instantiation. A mask leaking between occurrences shows up
+    /// here as a count that describes a sibling's data.
+    fn assert_counts_match_own_data(schema: &Schema, items: &[Decl], values: &[Value], at: &str) {
+        let expect = |r: &Ref, actual: usize, what: &str| {
+            if let Ref::Name(n) = r {
+                if let Some(id) = schema.count_id(n) {
+                    let Value::Int(declared) = &values[schema.count_slot(id)] else {
+                        panic!("{at}: count {n} is not an int slot");
+                    };
+                    assert_eq!(
+                        *declared, actual as i64,
+                        "{at}: count {n} says {declared} but {what} has {actual}"
+                    );
+                }
+            }
+        };
+        for (i, decl) in items.iter().enumerate() {
+            match (decl, &values[i]) {
+                (Decl::Array { len, .. }, Value::Array(a)) => expect(len, a.len(), "its array"),
+                (Decl::Repeat { count, body }, Value::Repeat(iters)) => {
+                    expect(count, iters.len(), "its block");
+                    for (k, iter) in iters.iter().enumerate() {
+                        assert_counts_match_own_data(schema, body, iter, &format!("{at}/iter{k}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Acceptance criterion for step 2: two instantiations of one declared axis
+    /// converge to **different** keep-masks.
+    ///
+    /// `N` is a single declaration with a single `AxisId`. The predicate needs
+    /// a value from position 1 of the first array and position 2 of the second,
+    /// so the two occurrences cannot select the same positions. Anything that
+    /// stores a mask per `AxisId` gives them the same one and fails.
+    #[test]
+    fn two_instances_of_one_axis_reach_different_masks() {
+        let text = "int T in 1..5\nrepeat T {\n  int N in 1..10\n  \
+                    array A[N] in -100..100\n}\n";
+        let data = build(text, "2\n4\n1 7 2 3\n4\n4 5 -3 6\n");
+
+        let reduced = reduce(&data, |t| {
+            let v = ints(t);
+            v.contains(&7) && v.contains(&-3)
+        });
+
+        assert_eq!(ints(&reduced.render()), vec![2, 1, 7, 1, -3]);
+
+        let Value::Repeat(iters) = &reduced.values[1] else {
+            panic!("expected a repeat")
+        };
+        let arrays: Vec<&Vec<i64>> = iters
+            .iter()
+            .map(|it| match &it[1] {
+                Value::Array(a) => a,
+                other => panic!("expected an array, got {other:?}"),
+            })
+            .collect();
+        // 7 came from position 1, -3 from position 2 of their own arrays.
+        assert_eq!(arrays[0], &vec![7]);
+        assert_eq!(arrays[1], &vec![-3]);
+        assert_ne!(
+            arrays[0], arrays[1],
+            "the two occurrences kept different positions"
+        );
+        assert_counts_match_own_data(&reduced.schema, &reduced.schema.items, &reduced.values, "");
+    }
+
+    /// Acceptance criterion for step 2: with nested `repeat`s, the same
+    /// `AxisId` exists once per outer instance, and selecting inside one outer
+    /// instance must not disturb its sibling.
+    ///
+    /// Both the inner block axis (`G`) and the array axis (`N`) occur twice.
+    /// The predicate forces the two outer instances to keep *different*
+    /// positions at both levels: outer 0 needs its second inner iteration,
+    /// outer 1 needs its first.
+    #[test]
+    fn nested_repeats_select_independently_per_outer_instance() {
+        let text = "int T in 1..5\nrepeat T {\n  int G in 1..5\n  repeat G {\n    \
+                    int N in 1..5\n    array A[N] in -100..100\n  }\n}\n";
+        let data = build(text, "2\n2\n1\n10\n3\n11 12 13\n2\n3\n20 21 22\n1\n23\n");
+
+        let reduced = reduce(&data, |t| {
+            let v = ints(t);
+            v.contains(&12) && v.contains(&20)
+        });
+
+        assert_eq!(ints(&reduced.render()), vec![2, 1, 1, 12, 1, 1, 20]);
+
+        // Dig out each outer instance's surviving inner array.
+        let Value::Repeat(outer) = &reduced.values[1] else {
+            panic!("expected the outer repeat")
+        };
+        assert_eq!(outer.len(), 2, "both outer instances are still needed");
+        let inner_arrays: Vec<Vec<i64>> = outer
+            .iter()
+            .map(|instance| {
+                let Value::Repeat(inner) = &instance[1] else {
+                    panic!("expected the inner repeat")
+                };
+                assert_eq!(inner.len(), 1, "each outer kept exactly one inner");
+                match &inner[0][1] {
+                    Value::Array(a) => a.clone(),
+                    other => panic!("expected an array, got {other:?}"),
+                }
+            })
+            .collect();
+
+        // Outer 0 kept inner position 1; outer 1 kept inner position 0. Sharing
+        // one mask across the two occurrences cannot produce this.
+        assert_eq!(inner_arrays[0], vec![12]);
+        assert_eq!(inner_arrays[1], vec![20]);
+
+        assert_counts_match_own_data(&reduced.schema, &reduced.schema.items, &reduced.values, "");
         assert_eq!(
             parse_input(&reduced.schema, &reduced.render()).unwrap(),
             reduced
