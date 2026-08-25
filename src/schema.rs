@@ -1949,10 +1949,7 @@ fn prune_tree(
 
     let mut current = data.clone();
     let mut changed = false;
-    loop {
-        let Some(Value::Graph(tree)) = value_at(&current.values, &path).cloned() else {
-            break;
-        };
+    while let Some(Value::Graph(tree)) = value_at(&current.values, &path).cloned() {
         let leaves = tree.leaves();
         if leaves.len() < 2 || tree.n <= min {
             break;
