@@ -43,6 +43,10 @@ enum Pred {
     MinTokens(usize),
     /// Drives boundary search rather than deletion.
     AnyAtLeast(i64),
+    /// The largest value must stay within one of the leading count. Deletion
+    /// and value shrinking can then each advance only one step per round, so
+    /// this only reduces fully if the scheduler runs to a fixed point.
+    MaxTracksCount,
 }
 
 impl Pred {
@@ -63,6 +67,10 @@ impl Pred {
             Pred::ContainsToken(t) => text.split_whitespace().any(|x| x == *t),
             Pred::MinTokens(k) => text.split_whitespace().count() >= *k,
             Pred::AnyAtLeast(v) => ints().iter().any(|x| x >= v),
+            Pred::MaxTracksCount => match ints().split_first() {
+                Some((count, rest)) => rest.iter().max().is_some_and(|m| *m >= count - 1),
+                None => false,
+            },
         }
     }
 }
@@ -635,6 +643,17 @@ repeat T {
         Pred::MinTokens(4),
     );
 
+    // --- the scheduler ----------------------------------------------------
+    // Roughly twenty structural/value alternations. Under the old fixed cap of
+    // sixteen this stopped partway and reported the partial result as final.
+    add(
+        "long_alternating_chain",
+        Some("int N in 1..40\narray A[N] in 1..N\n"),
+        Shape::Auto,
+        format!("20\n{}\n", vec!["20"; 20].join(" ")),
+        Pred::MaxTracksCount,
+    );
+
     // --- the unstructured fallback --------------------------------------
     add(
         "raw_tokens",
@@ -770,6 +789,7 @@ fn run(case: &Case) -> Snapshot {
         let mut shrinker = Shrinker::new(&mut judge, FailKind::WrongAnswer, &mut on_step);
         shrinker
             .run(&model)
+            .map(|(m, _)| m)
             .unwrap_or_else(|e| panic!("{}: reduction failed: {e}", case.name))
     };
 
@@ -891,6 +911,7 @@ fn corpus_covers_every_reduction_path() {
         "dynamic_bound_blocks_then_unblocks",
         "dynamic_bound_beside_relations",
         "dynamic_bound_in_repeat",
+        "long_alternating_chain",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

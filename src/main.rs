@@ -277,7 +277,7 @@ fn run() -> Result<bool, String> {
     let before_mag = parsed.avg_magnitude();
 
     let mut chain: Vec<usize> = vec![before_size];
-    let reduced = {
+    let (reduced, outcome) = {
         let mut on_step = |m: &Model| {
             let s = m.size();
             if chain.last() != Some(&s) {
@@ -293,6 +293,14 @@ fn run() -> Result<bool, String> {
             .map_err(|e| format!("shrinking counterexample: {e}"))?
     };
     print!("{}", term::clear_line());
+    if outcome == reduce::Fixpoint::Exhausted {
+        println!(
+            "{} reduction stopped on its internal round budget rather than at a \
+             fixed point, so this result may not be fully reduced. That is a bug \
+             in ccmin, not in your input; please report it.",
+            term::yellow("warning:")
+        );
+    }
 
     let text = reduced.render();
     if !oracle

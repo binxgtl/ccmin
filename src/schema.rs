@@ -2454,6 +2454,7 @@ fn select_columns(grid: &[Vec<i64>], keep: &[usize]) -> Vec<Vec<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reduce::{fixed_point_budget, to_fixed_point, Fixpoint};
 
     fn build(schema_text: &str, input: &str) -> SchemaData {
         let schema = parse_schema(schema_text).expect("schema should parse");
@@ -2462,17 +2463,23 @@ mod tests {
 
     /// Drive both passes to a fixpoint, the way `Shrinker` does.
     fn reduce(data: &SchemaData, predicate: impl Fn(&str) -> bool) -> SchemaData {
+        reduce_within(data, fixed_point_budget(data.size()), predicate).0
+    }
+
+    /// The same scheduler production uses, so the two cannot drift. Tests that
+    /// want to exercise the scheduler itself do it directly on
+    /// `to_fixed_point`, against synthetic passes, rather than through here.
+    fn reduce_within(
+        data: &SchemaData,
+        budget: usize,
+        predicate: impl Fn(&str) -> bool,
+    ) -> (SchemaData, Fixpoint) {
         let mut accept = |candidate: &SchemaData| predicate(&candidate.render());
-        let mut current = data.clone();
-        for _ in 0..16 {
-            let before = current.clone();
-            current = current.structural_pass(&mut accept);
-            current = current.value_pass(&mut accept);
-            if current == before {
-                break;
-            }
-        }
-        current
+        to_fixed_point(data.clone(), budget, |current| {
+            let next = current.structural_pass(&mut accept);
+            Ok::<_, ()>(next.value_pass(&mut accept))
+        })
+        .expect("a pure predicate cannot error")
     }
 
     /// The schedule alternates structural and value reduction and retries both
@@ -2758,6 +2765,99 @@ repeat T {
         };
         assert_eq!(masks(&state_a), masks(&state_b));
         assert_eq!(state_a.updates, state_b.updates);
+    }
+
+    /// 1. Structure alone: the values start where they want to be, so the
+    ///    value pass is a no-op and the run ends on the first idle round.
+    #[test]
+    fn structural_only_convergence() {
+        let text = "int N in 1..10\narray A[N] in 0..999\n";
+        let data = build(text, "5\n0 0 0 0 0\n");
+        let (out, outcome) = reduce_within(&data, fixed_point_budget(data.size()), |_| true);
+        assert_eq!(ints(&out.render()), vec![1, 0]);
+        assert_eq!(outcome, Fixpoint::Reached);
+    }
+
+    /// 2. Values alone: `N` is already at its floor, so nothing structural can
+    ///    move and only magnitudes come down.
+    #[test]
+    fn value_only_convergence() {
+        let text = "int N in 1..10\narray A[N] in 0..999\n";
+        let data = build(text, "1\n500\n");
+        let (out, outcome) = reduce_within(&data, fixed_point_budget(data.size()), |_| true);
+        assert_eq!(ints(&out.render()), vec![1, 0]);
+        assert_eq!(outcome, Fixpoint::Reached);
+    }
+
+    /// 4. The other direction of unlocking: deletion enabling a value step.
+    ///    Values are pinned while the array is long, so the value pass on its
+    ///    own achieves nothing until structure has been allowed to run first.
+    #[test]
+    fn a_structural_pass_can_enable_a_later_value_pass() {
+        let text = "int N in 1..10\narray A[N] in 0..999\n";
+        let data = build(text, "5\n9 9 9 9 9\n");
+        let short_or_large = |rendered: &str| {
+            let v = ints(rendered);
+            let (_, rest) = v.split_first().expect("a count");
+            rest.len() < 3 || rest.iter().all(|x| *x >= 5)
+        };
+
+        // On its own the value pass stalls at the floor the predicate imposes
+        // while the array is still long: 5, not 0.
+        let mut accept = |c: &SchemaData| short_or_large(&c.render());
+        let values_first = data.value_pass(&mut accept);
+        assert_eq!(ints(&values_first.render()), vec![5, 5, 5, 5, 5, 5]);
+
+        // Run in the real order, deletion goes first and unpins them.
+        let out = reduce(&data, short_or_large);
+        assert_eq!(ints(&out.render()), vec![1, 0]);
+    }
+
+    /// 5/8. A budget too small to finish reports that it stopped early rather
+    ///      than passing off a partly reduced result as the answer.
+    #[test]
+    fn a_short_budget_reports_that_it_stopped_early() {
+        let n = 20usize;
+        let text = "int N in 1..40\narray A[N] in 1..N\n";
+        let data = build(text, &format!("{n}\n{}\n", vec!["20"; n].join(" ")));
+        let pred = |rendered: &str| {
+            let v = ints(rendered);
+            let (count, rest) = v.split_first().expect("a count");
+            rest.iter().max().is_some_and(|m| *m >= count - 1)
+        };
+
+        let (partial, outcome) = reduce_within(&data, 4, pred);
+        assert_eq!(outcome, Fixpoint::Exhausted);
+        assert!(
+            ints(&partial.render())[0] > 1,
+            "four rounds cannot finish a twenty-step chain"
+        );
+
+        // The same input with a real budget does finish.
+        let (full, outcome) = reduce_within(&data, fixed_point_budget(data.size()), pred);
+        assert_eq!(outcome, Fixpoint::Reached);
+        assert_eq!(ints(&full.render()), vec![1, 1]);
+    }
+
+    /// A chain that needs far more than sixteen alternations.
+    ///
+    /// The oracle accepts only while the largest value is within one of `N`.
+    /// Deleting an element drops `N`, which the dynamic bound will not allow
+    /// while a larger value survives, and the largest value cannot fall more
+    /// than one step ahead of `N`. So each outer round makes exactly one unit
+    /// of progress, and reaching the fixed point takes about `n` of them.
+    #[test]
+    fn a_long_alternating_chain_reaches_its_fixed_point() {
+        let n = 20usize;
+        let text = "int N in 1..40\narray A[N] in 1..N\n";
+        let data = build(text, &format!("{n}\n{}\n", vec!["20"; n].join(" ")));
+
+        let out = reduce(&data, |rendered| {
+            let v = ints(rendered);
+            let (count, rest) = v.split_first().expect("a count");
+            rest.iter().max().is_some_and(|m| *m >= count - 1)
+        });
+        assert_eq!(ints(&out.render()), vec![1, 1]);
     }
 
     fn ints(text: &str) -> Vec<i64> {

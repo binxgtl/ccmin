@@ -85,6 +85,58 @@ pub fn shrink_ints(vals: &[i64], accept: impl FnMut(&[i64]) -> bool) -> Vec<i64>
 }
 
 /// Pull every element toward `target`, repeating until a round changes nothing.
+/// How a run of alternating passes ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fixpoint {
+    /// A whole round changed nothing. This is the normal ending.
+    Reached,
+    /// The defensive budget ran out first, so the result is only partly
+    /// reduced. The caller is expected to say so rather than pass it off as
+    /// finished.
+    Exhausted,
+}
+
+/// Run `round` until a whole round changes nothing.
+///
+/// Termination is by fixed point, not by the budget, and that distinction is
+/// the point of this function. Every accepted edit strictly decreases the pair
+/// (number of data elements, total distance from each value to its target):
+/// deletion lowers the first and leaves the second no higher, and a value step
+/// lowers the second and leaves the first alone. Both are non-negative
+/// integers, so no-change is always reached and the budget is not needed for
+/// termination.
+///
+/// The budget only stops a pass that violates that contract from hanging a
+/// CLI. Hitting it means a bug here, not a large input, so it is reported
+/// instead of being folded into a normal-looking result -- an earlier fixed
+/// cap of sixteen silently returned partly reduced output on inputs that
+/// needed more rounds.
+pub fn to_fixed_point<T, E>(
+    start: T,
+    budget: usize,
+    mut round: impl FnMut(&T) -> Result<T, E>,
+) -> Result<(T, Fixpoint), E>
+where
+    T: Clone + PartialEq,
+{
+    let mut best = start;
+    for _ in 0..budget {
+        let next = round(&best)?;
+        if next == best {
+            return Ok((best, Fixpoint::Reached));
+        }
+        best = next;
+    }
+    Ok((best, Fixpoint::Exhausted))
+}
+
+/// A budget generous enough that reaching it means a bug, scaled by the only
+/// quantity that bounds productive rounds: each round must delete at least one
+/// element or shrink at least one value.
+pub fn fixed_point_budget(size: usize) -> usize {
+    4 * size + 64
+}
+
 pub fn shrink_ints_toward(
     vals: &[i64],
     target: i64,
@@ -172,6 +224,63 @@ pub fn shrink_value_toward(x: i64, target: i64, mut accept: impl FnMut(i64) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 7. A first round that changes nothing ends it, with no further calls.
+    #[test]
+    fn a_round_that_changes_nothing_terminates() {
+        let mut calls = 0;
+        let out = to_fixed_point(5i32, 100, |v| {
+            calls += 1;
+            Ok::<_, ()>(*v)
+        });
+        assert_eq!(out, Ok((5, Fixpoint::Reached)));
+        assert_eq!(calls, 1, "no round runs after the fixed point is seen");
+    }
+
+    /// The budget is a backstop, not the terminator: a chain far longer than
+    /// any fixed cap still finishes on its own.
+    #[test]
+    fn a_long_chain_ends_by_fixed_point_not_by_budget() {
+        let mut rounds = 0;
+        let out = to_fixed_point(500i32, fixed_point_budget(500), |v| {
+            rounds += 1;
+            Ok::<_, ()>((*v - 1).max(0))
+        });
+        assert_eq!(out, Ok((0, Fixpoint::Reached)));
+        assert_eq!(rounds, 501, "500 steps down, then one no-op round");
+    }
+
+    /// 8. When the budget does run out, the caller is told rather than handed
+    ///    a partial result that looks finished.
+    #[test]
+    fn an_exhausted_budget_is_reported() {
+        let out = to_fixed_point(500i32, 10, |v| Ok::<_, ()>((*v - 1).max(0)));
+        assert_eq!(out, Ok((490, Fixpoint::Exhausted)));
+
+        // A budget of zero runs nothing at all and still reports honestly.
+        assert_eq!(
+            to_fixed_point(7i32, 0, |v| Ok::<_, ()>(*v)),
+            Ok((7, Fixpoint::Exhausted))
+        );
+    }
+
+    /// An error from a pass stops the run and propagates unchanged.
+    #[test]
+    fn a_failing_round_propagates_its_error() {
+        let out = to_fixed_point(3i32, 100, |v| match v {
+            3 => Ok(2),
+            _ => Err("oracle died"),
+        });
+        assert_eq!(out, Err("oracle died"));
+    }
+
+    /// The budget scales with the input, because the number of productive
+    /// rounds does: each one deletes an element or shrinks a value.
+    #[test]
+    fn the_budget_scales_with_the_input() {
+        assert!(fixed_point_budget(1000) > fixed_point_budget(10));
+        assert!(fixed_point_budget(0) >= 64, "a tiny input still gets slack");
+    }
 
     #[test]
     fn ddmin_finds_single_required_element() {

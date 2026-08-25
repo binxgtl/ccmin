@@ -1,0 +1,10 @@
+# ccmin baseline snapshot for `long_alternating_chain`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 21
+final_tokens = 2
+oracle_calls = 339
+predicate_holds = true
+[input]
+1
+1

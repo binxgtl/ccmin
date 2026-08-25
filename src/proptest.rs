@@ -354,7 +354,7 @@ fn every_candidate_the_reducer_accepts_is_structurally_valid() {
             };
             let mut on_step = |m: &Model| accepted.push(m.clone());
             let mut shrinker = Shrinker::new(&mut judge, FailKind::WrongAnswer, &mut on_step);
-            shrinker.run(&model).expect("pure predicate cannot error")
+            shrinker.run(&model).expect("pure predicate cannot error").0
         };
 
         // Property 2, checked on every intermediate step.
@@ -401,7 +401,7 @@ fn reduction_never_grows_the_input() {
             };
             let mut on_step = |_: &Model| {};
             let mut shrinker = Shrinker::new(&mut judge, FailKind::WrongAnswer, &mut on_step);
-            shrinker.run(&model).unwrap()
+            shrinker.run(&model).unwrap().0
         };
         assert!(
             reduced.size() <= before,
@@ -430,7 +430,7 @@ fn tree_reduction_preserves_treeness_under_a_chaotic_oracle() {
             };
             let mut on_step = |m: &Model| accepted.push(m.clone());
             let mut shrinker = Shrinker::new(&mut judge, FailKind::WrongAnswer, &mut on_step);
-            shrinker.run(&tree).unwrap()
+            shrinker.run(&tree).unwrap().0
         };
 
         for (i, candidate) in accepted.iter().enumerate() {

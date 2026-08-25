@@ -1,6 +1,6 @@
 # Shared dimensions — design note for v0.5
 
-Status: revision 11. Implementation under way; every reduction path runs
+Status: revision 12. Implementation under way; every reduction path runs
 through the cascade engine, the first bidirectional relation is built, and the
 first *non*-relational dependency is built beside it.
 
@@ -799,6 +799,8 @@ it. The implementation tests the static-bound analogue instead and asserts that
 10. Count-referenced numeric bounds.                         done
    Not a producer at all: a value dependency that takes no
    part in propagation. See section 21.
+11. One scheduler, terminating on convergence.               done
+   Fixed a real truncation bug. Feature freeze for v0.5.
 ```
 
 Step 8 was not on the numbered list. Step 6 is the only item that was, and it is
@@ -1406,3 +1408,131 @@ tomorrow.
 The two single-detector rows are the informative ones, and they are informative
 in opposite directions: the real reducer's schedule is covered *only* by
 benchcases, and the helper's *only* by unit tests. Neither reaches the other.
+
+
+---
+
+## 22. The round cap was a semantic bound
+
+Section 21 established that retrying structural reduction after value reduction
+is correctness-relevant. That makes the shape of the retry loop part of the
+reducer's semantics, and it was worth two separate questions.
+
+### Why the loops were duplicated
+
+`Shrinker::run` scheduled `Model`s; the `reduce` helper in `schema.rs` scheduled
+`SchemaData` so that schema tests could avoid building a `Judge` and running a
+program. The bodies were identical -- same cap, same order, same `==` check --
+and the production one additionally propagated oracle errors and dispatched over
+all six `Model` variants.
+
+The duplication bought nothing. A copy is not an independent implementation, so
+it never cross-checked anything; it only meant a fault in either copy was
+invisible to the other's tests. Breaking the production loop was caught by
+benchcases and no unit test. Breaking the helper was caught by unit tests and no
+benchcase.
+
+### Why sixteen, and why that was wrong
+
+Sixteen was a safety bound written when structural and value passes were assumed
+to unlock one another once or twice. It silently became a semantic bound:
+reduction stopped there and reported the result as final.
+
+Termination never depended on it. Every accepted edit strictly decreases the
+pair
+
+```text
+(number of data elements, total distance from each value to its target)
+```
+
+under lexicographic order: deletion lowers the first and cannot raise the second
+-- it drops non-negative terms from a sum -- and a value step lowers the second
+while leaving the first alone. Both components are non-negative integers, so
+"a round changed nothing" is always reached. The cap was never the terminator; it
+was a backstop that happened to fire first on long inputs.
+
+### A legal case that needs more than sixteen
+
+Expressible with v0.5 features as they already stand, no new feature invented
+for it:
+
+```text
+int N in 1..40
+array A[N] in 1..N
+```
+
+with `N = 20`, every value `20`, and an oracle that accepts while the largest
+value is within one of `N`. Deleting an element lowers `N`, which the dynamic
+bound refuses while a larger value survives; and the largest value cannot fall
+more than one step ahead of `N` without losing the failure. So each outer round
+makes exactly one unit of progress, and reaching the fixed point takes about
+twenty.
+
+Under the old cap this returned `N = 5` with four values still present, as a
+finished answer. It is now `long_alternating_chain` in the corpus, driven
+through the production reducer rather than a helper.
+
+**The cap was an accidental semantic bound and the truncation was a correctness
+bug.** Not a performance policy: nothing about it was tuned, and no benchcase
+oracle count changed when it was lifted, because no existing case reached it.
+
+### What replaced it
+
+One primitive, `reduce::to_fixed_point`, used by both production and the test
+helper. It terminates when a whole round changes nothing. It still takes a
+budget, because a pass that violates the decreasing-measure contract would
+otherwise hang a CLI, but the budget is now
+
+- scaled by input size, since that is what bounds productive rounds, and
+- *reported*: exhaustion returns `Fixpoint::Exhausted`, the CLI prints a warning
+  saying the result may not be fully reduced and that this is a ccmin bug, and
+  the type makes callers acknowledge which case they got.
+
+Sharing does not weaken testing here, which was the thing to check before
+deduplicating. The scheduler is tested directly, against synthetic passes, with
+no schema or model involved -- convergence, long chains, exhaustion, a zero
+budget, error propagation. Those tests would be impossible to write against
+either old copy without dragging in a whole model. What is lost is nothing,
+because a copy was never an independent check.
+
+### The other sixteen
+
+`shrink_ints_toward` has its own `rounds < 16` sweep cap. It is the same magic
+number and, in isolation, the same defect. It is now benign, and for a reason
+rather than by luck: the outer loop only stops when a whole round changes
+nothing, so a value pass that gives up early leaves work that the next round
+picks up. The inner cap can only change how work is distributed across rounds,
+not the final result. The twenty-round case above passes with that cap still in
+place, which is the evidence. It is left alone under the freeze, and noted here
+so it is not rediscovered as a mystery.
+
+### Rejected
+
+- **No budget at all.** The measure argument says the loop terminates, but it
+  assumes both passes only ever shrink. That is a property of today's passes,
+  not of the signature, and a hung CLI is a bad way to learn otherwise.
+- **A flat larger cap.** It moves the cliff instead of removing it, and leaves
+  the same silent truncation for whoever eventually walks off the new edge.
+- **Returning an error on exhaustion.** A partly reduced input is still useful.
+  Refusing to emit it would trade a quiet wrong answer for a loud lost one.
+- **Keeping the helper as an independent schedule.** Attractive in principle --
+  two implementations that must agree. In practice it was a copy, and copies
+  drift silently rather than disagreeing loudly.
+
+### Coverage
+
+| fault | detectors | benchcases move |
+| --- | --- | --- |
+| shared scheduler runs one round | 11 | yes |
+| convergence detection disabled | 6 | yes |
+| test call site given a budget of one | 4 | no |
+| exhaustion reported as success | 2 | no |
+| production call site given a budget of one | 1 | yes |
+| structural pass not retried after values | 1 | yes |
+
+The two single-detector rows are both production *call site* faults, caught by
+the benchcase corpus and by no unit test. That asymmetry is deliberate and is
+what benchcases are for; it is not evidence that a unit test is missing. The
+important change is the top row: a fault in the scheduler itself is now caught
+from both directions at once, which is exactly what the duplicated loops could
+not do.

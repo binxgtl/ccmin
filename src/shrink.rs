@@ -9,7 +9,10 @@
 
 use crate::model::{ArrayCase, GraphCase, Model};
 use crate::oracle::{FailKind, Judge};
-use crate::reduce::{ddmin, ddmin_allow_empty, shrink_ints, shrink_value};
+use crate::reduce::{
+    ddmin, ddmin_allow_empty, fixed_point_budget, shrink_ints, shrink_value, to_fixed_point,
+    Fixpoint,
+};
 
 pub struct Shrinker<'a> {
     judge: &'a mut dyn Judge,
@@ -49,22 +52,22 @@ impl<'a> Shrinker<'a> {
         ok
     }
 
-    pub fn run(&mut self, start: &Model) -> Result<Model, String> {
-        let mut best = start.clone();
-        // Structural and value passes can unlock one another. Keep a generous
-        // safety bound, while still stopping immediately at a fixpoint.
-        for _ in 0..16 {
-            let before = best.clone();
-            best = self.structural(&best);
-            best = self.values(&best);
-            if let Some(error) = self.error.take() {
-                return Err(error);
+    /// Reduce to a local fixed point.
+    ///
+    /// Structural and value passes unlock one another -- a deletion that is
+    /// illegal now can become legal once values have come down -- so neither
+    /// pass is run once. The alternation stops when a whole round changes
+    /// nothing; see `reduce::to_fixed_point` for why that always happens.
+    pub fn run(&mut self, start: &Model) -> Result<(Model, Fixpoint), String> {
+        let budget = fixed_point_budget(start.size());
+        to_fixed_point(start.clone(), budget, |current| {
+            let mut next = self.structural(current);
+            next = self.values(&next);
+            match self.error.take() {
+                Some(error) => Err(error),
+                None => Ok(next),
             }
-            if best == before {
-                break;
-            }
-        }
-        Ok(best)
+        })
     }
 
     // ---- structural ------------------------------------------------------
@@ -281,7 +284,7 @@ mod tests {
         let mut recorder = Recorder { seen: Vec::new() };
         let mut on_step = |_: &Model| {};
         let mut shrinker = Shrinker::new(&mut recorder, FailKind::WrongAnswer, &mut on_step);
-        let reduced = shrinker.run(&model).unwrap();
+        let (reduced, _) = shrinker.run(&model).unwrap();
 
         // The reducer still does its job.
         assert_eq!(
