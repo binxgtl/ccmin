@@ -93,6 +93,7 @@ fails if one is dropped.
 | `dynamic_bound_blocks_then_unblocks` | a count bound that only yields after value shrinking |
 | `dynamic_bound_beside_relations` | a numeric bound sharing a schema with all three producers |
 | `dynamic_bound_in_repeat` | one dynamic bound per instance |
+| `long_alternating_chain` | ~20 structural/value alternations before convergence |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with
