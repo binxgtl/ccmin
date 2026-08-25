@@ -226,7 +226,7 @@ can get wrong.
 It is also where the constraints live, and constraints are the difference
 between a useful reduced case and a misleading one:
 
-```text
+```schema
 # input.schema -- the problem statement, written down
 int N in 1..50
 array A[N] in 1..1000000
@@ -267,11 +267,17 @@ array A[N] in -1000000000..1000000000
 matrix G[R][C] in 0..1            R rows of C values
 tree E vertices N                 N-1 edges, checked connected and acyclic
 graph E[M] vertices N             M one-based edges
+index I[K] into N                 K references to positions counted by N
+permutation P[N]                  the values 1..=N, each exactly once
+array W[P.values] in 0..99        one entry per value of P, in P's order
+array B[N] in 1..N                a range may name an earlier int
 repeat T {                        the block, T times
   int K in 1..100
-  array B[K]
+  array C[K]
 }
 ```
+
+#### Counts are derived, and may be shared
 
 Count fields (`N` in `array A[N]`) are **derived**: they are recomputed from the
 data after every edit and never shrunk on their own, so a declared length cannot
@@ -279,10 +285,72 @@ drift out of step with what follows it. A bound on a count is a floor on the
 structure — `int N in 1..50` means the array is never emptied. A literal count
 (`array A[3]`) is fixed and its length is left alone.
 
-Two restrictions, both reported clearly rather than silently mishandled: a name
-may be used as a count by only one declaration (otherwise the two would have to
-shrink in lockstep), and a count must be declared in the same block as the thing
-it sizes.
+Several declarations may share one count:
+
+```schema
+int N in 1..10
+array A[N] in -100..100
+array B[N] in -100..100
+```
+
+`A` and `B` are two views of the same `N` positions. Deleting position 3 deletes
+it from both, so they cannot fall out of step — not because a rule keeps them
+aligned, but because there is only one set of positions to delete from. The same
+holds for everything else sharing a count: dropping a vertex drops the edges
+that touched it, dropping a position drops the `index` entries aiming at it, and
+so on to a fixed point before anything is written out.
+
+That is also how weighted edges and per-vertex data are expressed — a parallel
+array on the same count:
+
+```schema
+int N in 1..10
+int M in 0..20
+graph E[M] vertices N
+array W[M] in 0..99               # one weight per edge
+array Colour[N] in 0..99          # one label per vertex
+```
+
+#### References and magnitudes are not the same thing
+
+Two declarations can both mention `N` and mean nothing alike:
+
+```schema
+int N in 1..10
+array A[N] in 0..999
+int K in 0..10
+index I[K] into N                 # I's values NAME positions counted by N
+int X in 1..N                     # X's value is a NUMBER bounded by N
+```
+
+- **A reference names an element.** When positions are deleted, a surviving
+  reference is *renumbered* to where its target ended up, and a reference to a
+  deleted position makes the whole input invalid, so that candidate is
+  discarded. The number changes; what it points at does not.
+- **A magnitude names a quantity.** Deleting positions never rewrites it. If it
+  no longer fits its range, that candidate is set aside and offered again later,
+  once value shrinking has brought the number down.
+
+`permutation P[N]` is a reference in both directions: its values name positions
+on its own second axis, spelled `P.values`, so `array W[P.values]` follows the
+values while `array Colour[N]` follows the positions. Shrinking either end pulls
+the other with it, and whatever survives is still a permutation.
+
+ccmin never infers reference behaviour from a range. `array A[N] in 1..N` is an
+ordinary integer array whose values happen to be bounded by `N`: duplicates are
+legal, nothing is renumbered, and no second axis exists to point at.
+
+#### One-based in the file, zero-based only inside
+
+Everything in a schema input is **one-based**, because that is what problem
+statements use: edge endpoints, `index` targets and `permutation` values are all
+in `1..=N`. Positions are zero-based inside ccmin and that never reaches your
+file. When positions are deleted, labels are rewritten so the survivors are
+`1..=k` again with their order preserved.
+
+Two restrictions, both reported clearly rather than silently mishandled: a count
+must be declared in the same block as the thing it sizes, and a range that names
+a count may only name an `int` declared earlier in that same block.
 
 `--schema` is mutually exclusive with `--shape` and `--guess-header`, since a
 schema already states what those would try to infer.
@@ -292,9 +360,24 @@ schema already states what those would try to infer.
 Being specific about this, because a shrinker that quietly mangles your input
 is worse than no shrinker:
 
-- **Weighted edges, per-vertex data and geometry are not modelled.** Use raw
-  mode for those formats; tree and graph shapes currently cover unweighted
-  one-based edge lists only.
+- **Auto-detected `tree` and `graph` shapes cover unweighted one-based edge
+  lists only.** Weighted edges and per-vertex data *are* expressible under
+  `--schema`, as parallel arrays on the same count (above); it is shape
+  detection, not the model, that stops at plain edge lists. Geometry is not
+  modelled either way — use raw mode.
+- **Ranges take a literal or one name, never an expression.** `in 1..N` works;
+  `in 1..N-1`, `in 1..min(N,100)` and arithmetic in general do not. The name
+  must be an `int` declared earlier in the same block.
+- **A count has exactly one set of positions.** Two declarations sharing a
+  count always share its positions. There is no way to say "the same length as
+  `N`, but independently deletable" — that needs named axes, which are
+  deliberately not in 0.5.0 because nothing so far has required them.
+- **No relation constrains only a size.** Every dependency ccmin models either
+  decides which elements survive or bounds a value. A rule of the form "these
+  must have equal length, and nothing else" has no way to be written, because
+  no feature has yet needed one. The design note in the repository
+  (`design/shared-dimensions.md`) records why that gap is left open rather than
+  filled speculatively.
 - **Constraints apply only under `--schema`.** Without one, nothing knows the
   problem's bounds and a value may be shrunk to `0` when the statement forbids
   it. Auto-detected shapes have no constraint information at all.

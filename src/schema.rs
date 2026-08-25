@@ -381,8 +381,8 @@ fn build_codomain_axes(
             Decl::Permutation { name, len, .. } => {
                 let Ref::Name(n) = len else {
                     return Err(format!(
-                        "`{name}` needs a named count, not a literal length: its codomain has \
-                         to be an axis"
+                        "`{name}` needs a declared count for its length, as in \
+                         `permutation {name}[N]`, not a fixed number"
                     ));
                 };
                 let Some(count) = count_by_name.get(n).copied() else {
@@ -392,8 +392,8 @@ fn build_codomain_axes(
                 };
                 if codomain_by_name.values().any(|a| axes[*a].count == count) {
                     return Err(format!(
-                        "`{n}` already carries a permutation; a count may carry at most one, \
-                         because its default axis is that permutation's domain"
+                        "`{n}` already has a permutation; a count may have at most one, so \
+                         that `{n}` names one set of positions, not two"
                     ));
                 }
                 codomain_by_name.insert(name.clone(), axes.len());
@@ -442,8 +442,8 @@ fn check_index_targets(
                 ..
             } if !count_by_name.contains_key(n) => {
                 return Err(format!(
-                    "`{name}` indexes into `{n}`, but nothing is sized by `{n}`, so there is \
-                     no axis to reference"
+                    "`{name}` indexes into `{n}`, but nothing is sized by `{n}`, so there \
+                     are no positions for it to point at"
                 ));
             }
             Decl::Repeat { body, .. } => check_index_targets(body, count_by_name)?,
@@ -2510,6 +2510,32 @@ array A[N] in 0..999
         assert_eq!(ints(&out.render()), vec![1, 0]);
     }
 
+    /// Every complete schema in the README is parsed here, so the documented
+    /// language cannot drift from the implemented one. Blocks fenced as
+    /// `schema` are meant to stand alone; the syntax reference is fenced as
+    /// `text` because it is a list of fragments, not a schema.
+    #[test]
+    fn every_readme_schema_example_parses() {
+        const FENCE: &str = "```schema\n";
+        let readme = include_str!("../README.md");
+        let mut rest = readme;
+        let mut found = 0;
+        while let Some(start) = rest.find(FENCE) {
+            let body = &rest[start + FENCE.len()..];
+            let end = body.find("```").expect("unterminated fence");
+            found += 1;
+            let block = &body[..end];
+            if let Err(e) = parse_schema(block) {
+                panic!("README schema block {found} does not parse: {e}\n{block}");
+            }
+            rest = &body[end..];
+        }
+        assert!(
+            found >= 4,
+            "expected several complete examples, found {found}"
+        );
+    }
+
     // ---- dynamic numeric bounds -----------------------------------------
 
     /// 1. `array A[N] in 1..N` parses and round-trips unchanged.
@@ -3741,8 +3767,8 @@ repeat T {
         }
     }
 
-    /// Acceptance criterion for step 2: two instantiations of one declared axis
-    /// converge to **different** keep-masks.
+    /// Two instantiations of one declared axis converge to **different**
+    /// keep-masks.
     ///
     /// `N` is a single declaration with a single `AxisId`. The predicate needs
     /// a value from position 1 of the first array and position 2 of the second,
@@ -3781,9 +3807,8 @@ repeat T {
         assert_counts_match_own_data(&reduced.schema, &reduced.schema.items, &reduced.values, "");
     }
 
-    /// Acceptance criterion for step 2: with nested `repeat`s, the same
-    /// `AxisId` exists once per outer instance, and selecting inside one outer
-    /// instance must not disturb its sibling.
+    /// With nested `repeat`s the same `AxisId` exists once per outer instance,
+    /// and selecting inside one outer instance must not disturb its sibling.
     ///
     /// Both the inner block axis (`G`) and the array axis (`N`) occur twice.
     /// The predicate forces the two outer instances to keep *different*

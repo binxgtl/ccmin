@@ -1,6 +1,6 @@
 [package]
 name = "ccmin"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Find a failing test for your solution, then shrink it to a small input that still fails."
@@ -9,6 +9,14 @@ readme = "README.md"
 repository = "https://github.com/binxgtl/ccmin"
 keywords = ["competitive-coding", "testing", "shrinking", "delta-debugging", "cpp"]
 categories = ["command-line-utilities", "development-tools::testing"]
+
+# Deliberate, not incidental. `design/` ships: source comments cite it by name
+# ("see revision 6 of the design note"), so leaving it out would publish
+# dangling references, and it is the explanation for why the reducer is shaped
+# the way it is. `benchcases/` and `testdata/` ship too -- they are what makes
+# `cargo test` work from an unpacked crate. CI workflow files mean nothing
+# outside the repository, and `progress.md` is personal working notes.
+exclude = [".github/", "progress.md"]
 
 # No dependencies. This is deliberate: ccmin runs untrusted-adjacent build
 # toolchains on a developer's machine, and a zero-dependency binary is
