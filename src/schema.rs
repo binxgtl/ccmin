@@ -85,6 +85,12 @@ impl Bounds {
 pub enum Ref {
     Lit(i64),
     Name(String),
+    /// `P.values`: the codomain axis of the permutation named `P`.
+    ///
+    /// The domain needs no spelling of its own -- it *is* the count's default
+    /// axis, so a bare `[N]` already names it, and `P.positions` would be an
+    /// alias with identical meaning.
+    Values(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +120,21 @@ pub enum Decl {
         edges: Ref,
         verts: Ref,
     },
+    /// `len` values forming a bijection: each names a one-based position on
+    /// this permutation's own codomain axis, and together they cover it
+    /// exactly once.
+    ///
+    /// Structurally this is an `Index` into a second axis of the same count,
+    /// which is where the preimage direction and the renumbering come from for
+    /// free. What a permutation adds is the image direction and the bijection
+    /// invariant.
+    Permutation {
+        name: String,
+        len: Ref,
+        /// Always `Ref::Values(name)`; stored so `sizing_roles` can hand out a
+        /// reference to it.
+        values: Ref,
+    },
     /// `len` values, each naming a one-based position on the axis that sizes
     /// `target`. A reference, not a magnitude: `index` says so explicitly
     /// rather than being inferred from an `in 1..N` bound, because
@@ -137,7 +158,8 @@ impl Decl {
             | Decl::Matrix { name, .. }
             | Decl::Tree { name, .. }
             | Decl::Graph { name, .. }
-            | Decl::Index { name, .. } => Some(name),
+            | Decl::Index { name, .. }
+            | Decl::Permutation { name, .. } => Some(name),
             Decl::Repeat { .. } => None,
         }
     }
@@ -203,6 +225,9 @@ pub struct Schema {
     counts: Vec<Count>,
     axes: Vec<Axis>,
     count_by_name: HashMap<String, CountId>,
+    /// The codomain axis of each permutation. Its count is the same as the
+    /// domain's; only the identity differs.
+    codomain_by_name: HashMap<String, AxisId>,
 }
 
 impl Schema {
@@ -238,6 +263,20 @@ impl Schema {
             // required a count to be declared in the block it sizes, so a
             // global lookup here cannot resolve to the wrong one.
             Ref::Name(n) => self.count_id(n).map(|id| self.default_axis(id)),
+            Ref::Values(perm) => self.codomain_by_name.get(perm).copied(),
+        }
+    }
+
+    /// The count a reference draws its cardinality from. A permutation's two
+    /// axes share one count, so both projections answer the same.
+    pub fn count_of(&self, r: &Ref) -> Option<CountId> {
+        match r {
+            Ref::Lit(_) => None,
+            Ref::Name(n) => self.count_id(n),
+            Ref::Values(perm) => self
+                .codomain_by_name
+                .get(perm)
+                .map(|axis| self.axes[*axis].count),
         }
     }
 
@@ -265,6 +304,68 @@ impl Schema {
     pub fn axis(&self, id: AxisId) -> &Axis {
         &self.axes[id]
     }
+}
+
+/// A permutation needs a second axis on its count: same cardinality, its own
+/// identity. Allocated after the counts exist, in declaration order.
+fn build_codomain_axes(
+    items: &[Decl],
+    count_by_name: &HashMap<String, CountId>,
+    axes: &mut Vec<Axis>,
+    codomain_by_name: &mut HashMap<String, AxisId>,
+) -> Result<(), String> {
+    for decl in items {
+        match decl {
+            Decl::Permutation { name, len, .. } => {
+                let Ref::Name(n) = len else {
+                    return Err(format!(
+                        "`{name}` needs a named count, not a literal length: its codomain has \
+                         to be an axis"
+                    ));
+                };
+                let Some(count) = count_by_name.get(n).copied() else {
+                    return Err(format!(
+                        "`{name}` is a permutation of `{n}`, but nothing is sized by `{n}`"
+                    ));
+                };
+                if codomain_by_name.values().any(|a| axes[*a].count == count) {
+                    return Err(format!(
+                        "`{n}` already carries a permutation; a count may carry at most one, \
+                         because its default axis is that permutation's domain"
+                    ));
+                }
+                codomain_by_name.insert(name.clone(), axes.len());
+                axes.push(Axis { count });
+            }
+            Decl::Repeat { body, .. } => {
+                build_codomain_axes(body, count_by_name, axes, codomain_by_name)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `X.values` must name a declared permutation.
+fn check_projections(
+    items: &[Decl],
+    codomain_by_name: &HashMap<String, AxisId>,
+) -> Result<(), String> {
+    for decl in items {
+        for (r, _) in sizing_roles(decl) {
+            if let Ref::Values(owner) = r {
+                if !codomain_by_name.contains_key(owner) {
+                    return Err(format!(
+                        "`{owner}.values` is used, but `{owner}` is not a permutation"
+                    ));
+                }
+            }
+        }
+        if let Decl::Repeat { body, .. } = decl {
+            check_projections(body, codomain_by_name)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_index_targets(
@@ -348,6 +449,9 @@ pub fn parse_schema(text: &str) -> Result<Rc<Schema>, String> {
     let mut axes = Vec::new();
     let mut count_by_name = HashMap::new();
     build_arenas(&items, &derived, &mut counts, &mut axes, &mut count_by_name);
+    let mut codomain_by_name = HashMap::new();
+    build_codomain_axes(&items, &count_by_name, &mut axes, &mut codomain_by_name)?;
+    check_projections(&items, &codomain_by_name)?;
     // An index can only reference an axis that exists, and an axis exists only
     // where something is sized by that count.
     check_index_targets(&items, &count_by_name)?;
@@ -358,6 +462,7 @@ pub fn parse_schema(text: &str) -> Result<Rc<Schema>, String> {
         counts,
         axes,
         count_by_name,
+        codomain_by_name,
     }))
 }
 
@@ -484,6 +589,23 @@ fn parse_decl(
                 verts,
             })
         }
+        "permutation" => {
+            let (name, dims, rest) = parse_name_dims(no, &tokens[1..])?;
+            if dims.len() != 1 {
+                return Err(at(
+                    "`permutation` needs a length, as in `permutation P[N]`".into()
+                ));
+            }
+            if !rest.is_empty() {
+                return Err(at(format!("unexpected `{}`", rest.join(" "))));
+            }
+            let values = Ref::Values(name.clone());
+            Ok(Decl::Permutation {
+                name,
+                len: dims[0].clone(),
+                values,
+            })
+        }
         "index" => {
             let (name, dims, rest) = parse_name_dims(no, &tokens[1..])?;
             if dims.len() != 1 {
@@ -516,8 +638,8 @@ fn parse_decl(
             Ok(Decl::Repeat { count, body })
         }
         other => Err(at(format!(
-            "unknown declaration `{other}` (expected int, array, matrix, tree, graph, index \
-             or repeat)"
+            "unknown declaration `{other}` (expected int, array, matrix, tree, graph, index, \
+             permutation or repeat)"
         ))),
     }
 }
@@ -602,6 +724,16 @@ fn ident(no: usize, token: &str) -> Result<String, String> {
 }
 
 fn value_ref(no: usize, token: &str) -> Result<Ref, String> {
+    if let Some((owner, field)) = token.split_once('.') {
+        let owner = ident(no, owner)?;
+        return match field {
+            "values" => Ok(Ref::Values(owner)),
+            other => Err(format!(
+                "line {no}: unknown projection `.{other}`; a permutation exposes `.values`, \
+                 and its domain is the count itself"
+            )),
+        };
+    }
     if let Ok(v) = token.parse::<i64>() {
         if v < 0 {
             return Err(format!("line {no}: count `{v}` cannot be negative"));
@@ -663,6 +795,7 @@ fn validate(
                 use_count(verts, "vertex count", name)?;
             }
             Decl::Index { name, len, .. } => use_count(len, "length", name)?,
+            Decl::Permutation { name, len, .. } => use_count(len, "length", name)?,
             Decl::Repeat { count, body } => {
                 use_count(count, "repeat count", "repeat")?;
                 validate(body, derived, all_names)?;
@@ -684,6 +817,9 @@ fn count_bounds_by_scan(items: &[Decl], r: &Ref) -> Option<Bounds> {
             Decl::Int { name, bounds } if name == n => Some(*bounds),
             _ => None,
         }),
+        // The pre-arena scan predates projections and has no answer for one.
+        // The equivalence test skips them for that reason.
+        Ref::Values(_) => None,
     }
 }
 
@@ -786,6 +922,14 @@ fn resolve(schema: &Schema, r: &Ref, current: &[i64], owner: &str) -> Result<usi
                 .ok_or_else(|| format!("`{owner}`: `{n}` has no value yet"))?;
             current[id]
         }
+        // A permutation's two axes share one count, so the codomain is as long
+        // as the domain.
+        Ref::Values(perm) => {
+            let id = schema
+                .count_of(r)
+                .ok_or_else(|| format!("`{owner}`: `{perm}` is not a permutation"))?;
+            current[id]
+        }
     };
     usize::try_from(v).map_err(|_| format!("`{owner}`: count {v} is negative"))
 }
@@ -856,6 +1000,19 @@ fn read_decl(
             let list = read_edges(cursor, m, n, name)?;
             Ok(Value::Graph(GraphCase { n, edges: list }))
         }
+        Decl::Permutation { name, len, .. } => {
+            let n = resolve(schema, len, current, name)?;
+            let mut mapping = Vec::with_capacity(n);
+            for _ in 0..n {
+                mapping.push(cursor.take(name)?);
+            }
+            if !is_permutation(&mapping) {
+                return Err(format!(
+                    "`{name}`: the {n} values are not a permutation of 1..={n}"
+                ));
+            }
+            Ok(Value::Array(mapping))
+        }
         Decl::Index { name, len, target } => {
             let n = resolve(schema, len, current, name)?;
             let extent = resolve(schema, target, current, name)?;
@@ -911,6 +1068,21 @@ fn check_bound(v: i64, bounds: &Bounds, name: &str) -> Result<(), String> {
             bounds.describe()
         ))
     }
+}
+
+/// Exactly the values `1..=len`, each once.
+fn is_permutation(values: &[i64]) -> bool {
+    let mut seen = vec![false; values.len()];
+    for v in values {
+        let Ok(index) = usize::try_from(*v - 1) else {
+            return false;
+        };
+        match seen.get_mut(index) {
+            Some(slot) if !*slot => *slot = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn is_tree(graph: &GraphCase) -> bool {
@@ -1074,6 +1246,7 @@ fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
                 sizes.push((verts, g.n));
             }
             (Decl::Index { len, .. }, Value::Array(refs)) => sizes.push((len, refs.len())),
+            (Decl::Permutation { len, .. }, Value::Array(m)) => sizes.push((len, m.len())),
             (Decl::Repeat { count, .. }, Value::Repeat(iters)) => sizes.push((count, iters.len())),
             _ => {}
         }
@@ -1084,13 +1257,13 @@ fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
     // would be the silent last-write-wins that made v0.4 reject sharing.
     #[cfg(debug_assertions)]
     {
-        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut seen: HashMap<CountId, usize> = HashMap::new();
         for (r, size) in &sizes {
-            if let Ref::Name(n) = r {
-                if let Some(previous) = seen.insert(n.as_str(), *size) {
+            if let Some(id) = schema.count_of(r) {
+                if let Some(previous) = seen.insert(id, *size) {
                     debug_assert_eq!(
                         previous, *size,
-                        "members sharing count {n} disagree: {previous} vs {size}"
+                        "members sharing count {id} disagree: {previous} vs {size}"
                     );
                 }
             }
@@ -1098,8 +1271,7 @@ fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
     }
 
     for (r, size) in sizes {
-        let Ref::Name(n) = r else { continue };
-        let Some(id) = schema.count_id(n) else {
+        let Some(id) = schema.count_of(r) else {
             continue;
         };
         // `values` is this block's own instantiation, so the count's static
@@ -1301,6 +1473,10 @@ enum Role {
     /// Distinguished from `GraphVertices` because a tree may only drop leaves.
     TreeVertices,
     Iterations,
+    /// A permutation's codomain. It carries no stored data of its own -- the
+    /// mapping lives on the domain -- so it contributes no positional edit;
+    /// its mask drives renumbering instead.
+    PermutationValues,
 }
 
 /// One declaration that an axis occurrence indexes, and how.
@@ -1345,6 +1521,12 @@ fn sizing_roles(decl: &Decl) -> Vec<(&Ref, Role)> {
         }
         // Only the length. `target` is a reference, not a size.
         Decl::Index { len, .. } => vec![(len, Role::Elements)],
+        // The domain holds the mapping; the codomain is a real axis with the
+        // same cardinality, and needs an occurrence even when nothing is
+        // declared on it, because the bijection narrows it.
+        Decl::Permutation { len, values, .. } => {
+            vec![(len, Role::Elements), (values, Role::PermutationValues)]
+        }
         Decl::Repeat { count, .. } => vec![(count, Role::Iterations)],
     }
 }
@@ -1369,6 +1551,9 @@ fn extent_of(value: &Value, role: Role) -> Option<usize> {
         (Value::Graph(g), Role::Edges) => g.edges.len(),
         (Value::Graph(g), Role::GraphVertices | Role::TreeVertices) => g.n,
         (Value::Repeat(iters), Role::Iterations) => iters.len(),
+        // A bijection has as many values as positions, and the mapping is
+        // stored on the domain, so the domain's length is the codomain's too.
+        (Value::Array(mapping), Role::PermutationValues) => mapping.len(),
         _ => return None,
     })
 }
@@ -1521,6 +1706,7 @@ fn induced_selections(
     let mut out = Vec::new();
     induce_from_graph_vertices(schema, data, occ, source, &mut out);
     induce_from_index_targets(schema, data, &occ.prefix, occ.axis, source, &mut out);
+    induce_from_permutation_image(schema, data, occ, source, &mut out);
     out
 }
 
@@ -1554,6 +1740,20 @@ fn induce_from_graph_vertices(
     }
 }
 
+/// The two references a reference-holding declaration carries: how many
+/// entries it has, and which axis its values name.
+///
+/// A permutation is an `Index` into a second axis of its own count, which is
+/// why the preimage rule and the renumbering below work on it unchanged. The
+/// only thing it adds is the image direction.
+fn reference_parts(decl: &Decl) -> Option<(&Ref, &Ref)> {
+    match decl {
+        Decl::Index { len, target, .. } => Some((len, target)),
+        Decl::Permutation { len, values, .. } => Some((len, values)),
+        _ => None,
+    }
+}
+
 /// An `index` into this axis loses every reference to a position that is gone.
 ///
 /// Reads the ORIGINAL references: their values are positions in the target's
@@ -1570,7 +1770,7 @@ fn induce_from_index_targets(
         return;
     };
     for (i, decl) in block.iter().enumerate() {
-        let Decl::Index { len, target, .. } = decl else {
+        let Some((len, target)) = reference_parts(decl) else {
             continue;
         };
         if schema.sizing_axis(target) != Some(axis) {
@@ -1595,6 +1795,56 @@ fn induce_from_index_targets(
                 })
                 .map(|(position, _)| position)
                 .collect(),
+        });
+    }
+}
+
+/// A permutation's domain determines its image: keeping a set of positions
+/// keeps exactly the values they map to.
+///
+/// This is the half `Index` does not provide. `Index` gives the preimage --
+/// when the target narrows, holders of dead references drop -- and a bijection
+/// additionally forces the reverse. Running to a fixed point makes the two meet
+/// at `codomain == image(domain)` and `domain == preimage(codomain)`, which is
+/// exactly the surviving permutation.
+fn induce_from_permutation_image(
+    schema: &Schema,
+    data: &SchemaData,
+    occ: &Occurrence,
+    source: &[usize],
+    out: &mut Vec<Induced>,
+) {
+    let Some(block) = block_at(&schema.items, &occ.prefix) else {
+        return;
+    };
+    for (i, decl) in block.iter().enumerate() {
+        let Decl::Permutation { len, values, .. } = decl else {
+            continue;
+        };
+        // Fires when the *domain* narrows; the preimage rule handles the other
+        // direction from the codomain.
+        if schema.sizing_axis(len) != Some(occ.axis) {
+            continue;
+        }
+        let Some(codomain) = schema.sizing_axis(values) else {
+            continue;
+        };
+        let mut path = occ.prefix.clone();
+        path.push(i);
+        let Some(Value::Array(mapping)) = value_at(&data.values, &path) else {
+            continue;
+        };
+        // The image, as zero-based codomain positions, read from the ORIGINAL
+        // mapping and the current domain mask.
+        let mut image: Vec<usize> = source
+            .iter()
+            .filter_map(|position| mapping.get(*position))
+            .filter_map(|label| usize::try_from(*label - 1).ok())
+            .collect();
+        image.sort_unstable();
+        out.push(Induced {
+            axis: codomain,
+            keep: image,
         });
     }
 }
@@ -1661,40 +1911,47 @@ fn renumber_indices(
     for (i, decl) in items.iter().enumerate() {
         let mut path = prefix.clone();
         path.push(i);
-        match decl {
-            Decl::Index { target, .. } => {
-                let Some(axis) = schema.sizing_axis(target) else {
-                    continue;
-                };
-                let Some(mask) = masks.get(&(prefix.clone(), axis)) else {
-                    continue; // the target was untouched, so the labels hold
-                };
-                let Some(Value::Array(refs)) = value_at(&trial.values, &path).cloned() else {
-                    continue;
-                };
-                let mut rewritten = Vec::with_capacity(refs.len());
-                for reference in refs {
-                    let old = usize::try_from(reference - 1).ok()?;
-                    // Position within the survivors, one-based. `None` here is
-                    // a dangling reference: reject the candidate.
-                    let new = mask.binary_search(&old).ok()? + 1;
-                    rewritten.push(new as i64);
-                }
-                put(trial, &path, Value::Array(rewritten));
+
+        if let Decl::Repeat { body, .. } = decl {
+            let iterations = match value_at(&trial.values, &path) {
+                Some(Value::Repeat(iters)) => iters.len(),
+                _ => 0,
+            };
+            for k in 0..iterations {
+                let mut inner = path.clone();
+                inner.push(k);
+                renumber_indices(schema, body, trial, &inner, masks)?;
             }
-            Decl::Repeat { body, .. } => {
-                let iterations = match value_at(&trial.values, &path) {
-                    Some(Value::Repeat(iters)) => iters.len(),
-                    _ => 0,
-                };
-                for k in 0..iterations {
-                    let mut inner = path.clone();
-                    inner.push(k);
-                    renumber_indices(schema, body, trial, &inner, masks)?;
-                }
-            }
-            _ => {}
+            continue;
         }
+
+        let Some((_, target)) = reference_parts(decl) else {
+            continue;
+        };
+        let Some(axis) = schema.sizing_axis(target) else {
+            continue;
+        };
+        let Some(mask) = masks.get(&(prefix.clone(), axis)) else {
+            continue; // the target was untouched, so the labels still hold
+        };
+        let Some(Value::Array(refs)) = value_at(&trial.values, &path).cloned() else {
+            continue;
+        };
+        let mut rewritten = Vec::with_capacity(refs.len());
+        for reference in refs {
+            let old = usize::try_from(reference - 1).ok()?;
+            // Position within the survivors, one-based. `None` here is a
+            // dangling reference: reject the candidate.
+            let new = mask.binary_search(&old).ok()? + 1;
+            rewritten.push(new as i64);
+        }
+        // No bijection re-check here on purpose. Read-time validation rejects
+        // a non-permutation input, and for candidates the image and preimage
+        // rules are exact inverses of one mapping, so every mask pair the
+        // worklist can reach is already matched. A guard here was written,
+        // then deliberately broken under five separate faults, and never once
+        // changed a test outcome; see design/shared-dimensions.md section 20.
+        put(trial, &path, Value::Array(rewritten));
     }
     Some(())
 }
@@ -1785,10 +2042,13 @@ fn apply_masks(value: &Value, ops: &[(Role, Vec<usize>)]) -> Option<Value> {
             }
             Value::Matrix(out)
         }
-        Value::Array(a) => {
-            let mask = find(Role::Elements)?;
-            Value::Array(mask.iter().filter_map(|&i| a.get(i).copied()).collect())
-        }
+        Value::Array(a) => match find(Role::Elements) {
+            Some(mask) => Value::Array(mask.iter().filter_map(|&i| a.get(i).copied()).collect()),
+            // A permutation's codomain mask drives renumbering rather than
+            // filtering: the mapping is stored on the domain.
+            None if find(Role::PermutationValues).is_some() => Value::Array(a.clone()),
+            None => return None,
+        },
         Value::Repeat(iters) => {
             let mask = find(Role::Iterations)?;
             Value::Repeat(mask.iter().filter_map(|&i| iters.get(i).cloned()).collect())
@@ -2722,6 +2982,7 @@ mod tests {
             Decl::Tree { verts, .. } => vec![verts],
             Decl::Graph { edges, verts, .. } => vec![edges, verts],
             Decl::Index { len, .. } => vec![len],
+            Decl::Permutation { len, .. } => vec![len],
             Decl::Repeat { count, .. } => vec![count],
         }
     }
@@ -3217,6 +3478,62 @@ repeat T {
         );
     }
 
+    /// Two index hops in series. This is the case that needs the worklist to
+    /// run a *second* round: narrowing `N` narrows `I`'s own axis, and only
+    /// once that has happened can `J`'s references into `I` be seen to dangle.
+    /// Every other cascade in this suite converges in one round, so without
+    /// this test the iteration itself is unexercised.
+    #[test]
+    fn a_two_hop_index_chain_needs_a_second_round() {
+        let text = "int N in 1..10
+array A[N] in 0..999
+int K in 0..10
+                    index I[K] into N
+int L in 0..10
+index J[L] into K
+";
+        let data = build(
+            text,
+            "4
+10 20 30 40
+3
+1 3 4
+2
+1 2
+",
+        );
+
+        let (occ, all) = occurrence_for(&data, "N");
+        // Drop label 3. Round 1: `I` loses its middle entry, so `K`'s axis
+        // becomes {0,2}. Round 2: `J`'s second reference named that entry, so
+        // `L`'s axis becomes {0}.
+        let state = propagate(&data, &occ, &[0, 1, 3], &all);
+        let axis_of = |n: &str| {
+            data.schema
+                .sizing_axis(&Ref::Name(n.into()))
+                .expect("declared count")
+        };
+        assert_eq!(
+            state.masks.get(&(Vec::new(), axis_of("K"))),
+            Some(&vec![0usize, 2])
+        );
+        assert_eq!(
+            state.masks.get(&(Vec::new(), axis_of("L"))),
+            Some(&vec![0usize])
+        );
+
+        let projected = project_fixpoint(&data, &state, &all).expect("projects");
+        // N, A, K, the surviving references renumbered, L, then J.
+        assert_eq!(
+            ints(&projected.render()),
+            vec![3, 10, 20, 40, 2, 1, 3, 1, 1]
+        );
+        assert_eq!(
+            parse_input(&projected.schema, &projected.render()).unwrap(),
+            projected
+        );
+    }
+
     /// A surviving reference whose target did not survive is a bug in the
     /// induction. Projection rejects the candidate rather than clipping it,
     /// renumbering it onto a neighbour, or emitting a dangling reference.
@@ -3383,6 +3700,206 @@ repeat T {
         // Keeping every vertex leaves both edges intact, so it still projects.
         let whole = project_occurrence(&data, &occ, &[0, 1, 2], &all).expect("projects");
         assert_eq!(ints(&whole.render()), vec![3, 1, 2, 2, 3]);
+    }
+
+    /// The section 9 litmus schema: a permutation with data on each side.
+    fn litmus() -> SchemaData {
+        let text = "int N in 1..10\npermutation P[N]\narray Colour[N] in 0..999\n\
+                    array Weight[P.values] in 0..999\n";
+        build(text, "5\n3 5 1 4 2\n11 12 13 14 15\n71 72 73 74 75\n")
+    }
+
+    fn axis_occurrence(data: &SchemaData, r: &Ref) -> (Occurrence, Vec<Occurrence>) {
+        let axis = data
+            .schema
+            .sizing_axis(r)
+            .expect("the reference has an axis");
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let occ = all
+            .iter()
+            .find(|o| o.axis == axis && o.prefix.is_empty())
+            .expect("a top-level occurrence")
+            .clone();
+        (occ, all)
+    }
+
+    /// 1. It parses, and it round-trips.
+    #[test]
+    fn a_permutation_parses_and_round_trips() {
+        let data = litmus();
+        assert_eq!(
+            ints(&data.render()),
+            vec![5, 3, 5, 1, 4, 2, 11, 12, 13, 14, 15, 71, 72, 73, 74, 75]
+        );
+        assert_eq!(parse_input(&data.schema, &data.render()).unwrap(), data);
+
+        // Two axes on one count: same cardinality, different identity.
+        let domain = data.schema.sizing_axis(&Ref::Name("N".into())).unwrap();
+        let codomain = data.schema.sizing_axis(&Ref::Values("P".into())).unwrap();
+        assert_ne!(domain, codomain);
+        assert_eq!(
+            data.schema.count_of(&Ref::Name("N".into())),
+            data.schema.count_of(&Ref::Values("P".into()))
+        );
+    }
+
+    /// 2, 4, 5, 6. Selecting domain positions on a nontrivial mapping. The
+    /// expected outputs are section 9's hand-computed table: domain data
+    /// follows positions, codomain data follows values, and the survivor is
+    /// still a permutation.
+    #[test]
+    fn selecting_positions_induces_the_image() {
+        let data = litmus();
+        let (occ, all) = axis_occurrence(&data, &Ref::Name("N".into()));
+
+        // Keep positions 1, 3, 5 (zero-based 0, 2, 4).
+        let kept = project_occurrence(&data, &occ, &[0, 2, 4], &all).expect("projects");
+        assert_eq!(
+            ints(&kept.render()),
+            vec![3, 3, 1, 2, 11, 13, 15, 71, 72, 73]
+        );
+
+        // Keep positions 2 and 4 (zero-based 1, 3).
+        let kept = project_occurrence(&data, &occ, &[1, 3], &all).expect("projects");
+        assert_eq!(ints(&kept.render()), vec![2, 2, 1, 12, 14, 74, 75]);
+        assert_eq!(parse_input(&kept.schema, &kept.render()).unwrap(), kept);
+    }
+
+    /// 3. Selecting codomain values propagates back through the preimage.
+    #[test]
+    fn selecting_values_induces_the_preimage() {
+        let data = litmus();
+        let (occ, all) = axis_occurrence(&data, &Ref::Values("P".into()));
+
+        // Drop value 4 -- keep values 1, 2, 3, 5 (zero-based 0, 1, 2, 4).
+        let kept = project_occurrence(&data, &occ, &[0, 1, 2, 4], &all).expect("projects");
+        assert_eq!(
+            ints(&kept.render()),
+            vec![4, 3, 4, 1, 2, 11, 12, 13, 15, 71, 72, 73, 75]
+        );
+
+        // Keep values 1 and 2 (zero-based 0, 1).
+        let kept = project_occurrence(&data, &occ, &[0, 1], &all).expect("projects");
+        assert_eq!(ints(&kept.render()), vec![2, 1, 2, 13, 15, 71, 72]);
+        assert_eq!(parse_input(&kept.schema, &kept.render()).unwrap(), kept);
+    }
+
+    /// 2 again, through the reducer rather than a hand-built mask: whatever it
+    /// accepts is still a permutation.
+    #[test]
+    fn every_accepted_candidate_is_still_a_permutation() {
+        let data = litmus();
+        let reduced = reduce(&data, |t| ints(t).contains(&74));
+
+        let (Value::Int(n), Value::Array(mapping)) = (&reduced.values[0], &reduced.values[1])
+        else {
+            panic!("unexpected shape")
+        };
+        assert_eq!(mapping.len() as i64, *n);
+        assert!(
+            is_permutation(mapping),
+            "{mapping:?} is not a permutation of 1..={n}"
+        );
+        assert_eq!(
+            parse_input(&reduced.schema, &reduced.render()).unwrap(),
+            reduced
+        );
+    }
+
+    /// 7. Two instances of one permutation declaration inside a repeat select
+    ///    independently; neither mask reaches the other.
+    #[test]
+    fn permutation_instances_do_not_leak_masks() {
+        let text = "int T in 1..3\nrepeat T {\n  int N in 1..10\n  permutation P[N]\n}\n";
+        let data = build(text, "2\n3\n2 3 1\n3\n3 1 2\n");
+
+        let mut all = Vec::new();
+        occurrences(
+            &data.schema,
+            &data.schema.items,
+            &data.values,
+            &Vec::new(),
+            &mut all,
+        );
+        let domain = data.schema.sizing_axis(&Ref::Name("N".into())).unwrap();
+        let instances: Vec<Occurrence> = all.iter().filter(|o| o.axis == domain).cloned().collect();
+        assert_eq!(instances.len(), 2, "one domain occurrence per instance");
+
+        // Instance 0 keeps only its first position; instance 1 is untouched.
+        let kept = project_occurrence(&data, &instances[0], &[0], &all).expect("projects");
+        assert_eq!(ints(&kept.render()), vec![2, 1, 1, 3, 3, 1, 2]);
+        assert_eq!(parse_input(&kept.schema, &kept.render()).unwrap(), kept);
+    }
+
+    /// 8. A bounded integer array stays a bounded integer array. Its values are
+    ///    magnitudes and the value pass clamps them; nothing infers
+    ///    references.
+    ///
+    ///    The literal `array A[N] in 1..N` of the design note is not
+    ///    expressible yet -- bounds take integers, not counts -- so this is
+    ///    the static-bound analogue of the same point.
+    #[test]
+    fn a_bounded_array_is_not_a_permutation() {
+        let text = "int N in 1..10\narray A[N] in 1..5\n";
+        let data = build(text, "3\n3 1 2\n");
+
+        // No permutation, so no codomain axis exists to reference.
+        assert!(data.schema.sizing_axis(&Ref::Values("A".into())).is_none());
+        assert!(parse_schema("int N in 1..10\narray A[N] in 1..5\narray B[A.values]\n").is_err());
+
+        // The values clamp toward the declared floor rather than being treated
+        // as identities.
+        let reduced = reduce(&data, |t| ints(t).len() >= 2);
+        let Value::Array(a) = &reduced.values[1] else {
+            panic!()
+        };
+        assert!(
+            a.iter().all(|v| *v == 1),
+            "{a:?} should have clamped to the bound"
+        );
+    }
+
+    /// 9. A mapping that is not a bijection is rejected when read.
+    #[test]
+    fn a_non_bijective_permutation_is_rejected() {
+        let schema = parse_schema("int N in 1..10\npermutation P[N]\n").unwrap();
+        for bad in ["3\n1 1 2\n", "3\n1 2 4\n", "3\n0 1 2\n"] {
+            let err = parse_input(&schema, bad).unwrap_err();
+            assert!(err.contains("not a permutation"), "{bad:?}: {err}");
+        }
+        parse_input(&schema, "3\n2 3 1\n").expect("a real permutation is fine");
+    }
+
+    /// 10. Graph, index and bijection all aimed at one schema, reaching a
+    ///     single fixed point through the existing worklist.
+    #[test]
+    fn graph_index_and_bijection_reach_one_fixed_point() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                    index I[M] into N\npermutation P[N]\n";
+        let data = build(text, "4 2\n1 2\n3 4\n1 3\n2 1 4 3\n");
+        let (occ, all) = axis_occurrence(&data, &Ref::Name("N".into()));
+
+        // Keeping vertices 1 and 2: the graph keeps edge 0, the index keeps
+        // reference 0, and the permutation's image is {1, 2}. One pass.
+        let state = propagate(&data, &occ, &[0, 1], &all);
+        let m_axis = data.schema.sizing_axis(&Ref::Name("M".into())).unwrap();
+        let codomain = data.schema.sizing_axis(&Ref::Values("P".into())).unwrap();
+        assert_eq!(state.masks.get(&(Vec::new(), m_axis)), Some(&vec![0usize]));
+        assert_eq!(
+            state.masks.get(&(Vec::new(), codomain)),
+            Some(&vec![0usize, 1])
+        );
+
+        let kept = project_fixpoint(&data, &state, &all).expect("projects");
+        assert_eq!(ints(&kept.render()), vec![2, 1, 1, 2, 1, 2, 1]);
+        assert_eq!(parse_input(&kept.schema, &kept.render()).unwrap(), kept);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Shared dimensions — design note for v0.5
 
-Status: revision 9. Implementation under way; every reduction path now runs
-through the cascade engine, including trees.
+Status: revision 10. Implementation under way; every reduction path runs
+through the cascade engine, and the first bidirectional relation is built.
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
 count-shrink propagation and where independence lives. Revision 4 fixed two
@@ -750,6 +750,24 @@ What matters is that **independence is expressed by naming a different axis**,
 never by a modifier such as `array A[N] independent`. Independence is not a
 property of an array; it is which axis the array points at (§6).
 
+**What was actually built (step 9).** Only the third bullet. `permutation P[N]`
+declares the relation and `P.values` names its codomain; `array W[P.values]`
+follows it. Neither `axis` nor `P.positions` was implemented:
+
+- `P.positions` would be an alias for the count's default axis with identical
+  runtime meaning, since a permutation's domain *is* that axis. `array C[N]`
+  already follows the domain. A second spelling for one thing is not
+  expressivity.
+- A general `axis` declaration still has exactly one inhabitant -- the
+  permutation codomain -- so it stays unbuilt on the same rule that keeps
+  `RequireCardinality` unbuilt. The two-independent-axes-on-one-count case in
+  the sketch above remains inexpressible, and that is the honest state.
+
+One gap the litmus surfaced: `array A[N] in 1..N` is still not expressible,
+because bounds take integer literals, not counts. Section 9's own example uses
+it. The implementation tests the static-bound analogue instead and asserts that
+`A.values` is rejected on a non-permutation.
+
 ---
 
 ## 10. Roadmap
@@ -774,6 +792,9 @@ property of an array; it is which axis the array points at (§6).
 8. Route tree pruning through the same pipeline.             done
    The last bespoke reducer; fixed a live bug and made
    vertex-labelled trees expressible.
+9. Permutation as the first bidirectional relation.          done
+   Producer #3, and the first that induces *into* an axis
+   it is also induced *from*.
 ```
 
 Step 8 was not on the numbered list. Step 6 is the only item that was, and it is
@@ -1121,3 +1142,110 @@ One honest note on coverage. The connectivity check has a single detector, a
 test that hands it a disconnected mask directly. Leaf pruning cannot generate
 one, so nothing else reaches it -- the same status as the dangling-reference
 guard, and worth stating rather than implying the corpus covers it.
+
+
+---
+
+## 20. What the first bidirectional relation exposed
+
+Step 7 predicted that a third producer would cost "one rule function and one
+line in `induced_selections`". The question this step was built to answer is
+whether bidirectionality breaks that.
+
+**It held, and for a reason worth stating precisely.** A permutation is
+`Vector<domain, Index(codomain)>` plus one thing. Everything `Index` already
+does applies unchanged: the preimage direction (the codomain narrows, so
+holders of dead references drop) and the label renumbering. Generalising them
+took one helper,
+
+```rust
+fn reference_parts(decl: &Decl) -> Option<(&Ref, &Ref)>
+```
+
+which answers "how many entries, and which axis do the values name" for both
+`Index` and `Permutation`. The genuinely new half is the image direction --
+narrowing the domain narrows the codomain -- and that is exactly one rule
+function plus one line at the seam.
+
+**But the abstraction is narrower than it looked.** The shared seam covers the
+half a bijection has in common with a one-way reference. It did not make the
+image direction cheaper; it made it *separable*. Calling the step-7 extraction
+"the induce seam" oversells it — it is the *reference* seam, and a relation
+that is not reference-shaped will not get the same discount. That is a real
+limit, and the next producer should be chosen to test it rather than to confirm
+this one.
+
+### A guard that could not be made to fire
+
+`renumber_indices` briefly re-checked that a renumbered permutation was still a
+bijection. It was deliberately broken under five separate faults -- image rule
+disabled, preimage rule disabled, renumbering skipped, propagation halted
+before convergence, and the guard alone -- and in every case the set of failing
+tests was byte-identical with and without it.
+
+It is structurally unreachable, not merely uncovered. Read-time validation
+rejects a non-bijective *input*. For *candidates*, the image and preimage rules
+are exact inverses of one stored mapping, so every mask pair the worklist can
+reach already satisfies `codomain == image(domain)`. Narrowing that arrives
+from elsewhere still passes through one of those two rules before projection.
+
+It was removed. An assertion that no fault can trip is not a safety net; it is
+a claim about the code that the code cannot check. The claim now lives in a
+comment at the site, next to a pointer here.
+
+### The gap this step actually found
+
+Halting the worklist after a single round broke *nothing*. Every cascade in the
+corpus -- graph, index, tree, and both permutation directions -- reaches its
+fixed point in one round, because each rule maps a set straight to its exact
+image or preimage. The iteration that §5 is named for was never exercised.
+
+Reaching a second round needs producers in series, which took a two-hop chain:
+
+```text
+int N in 1..10
+array A[N] in 0..999
+int K in 0..10
+index I[K] into N        # round 1: N narrows, so I's own axis narrows
+int L in 0..10
+index J[L] into K        # round 2: only now can J's references dangle
+```
+
+`a_two_hop_index_chain_needs_a_second_round` pins it, and halting after one
+round now fails exactly that test. This is the strongest argument so far for
+the worklist over a fixed two-pass scheme, and it is embarrassing that it
+arrived at step 9 rather than step 4 — step 4's lattice test checked the merge
+rule directly and never drove `propagate` far enough to iterate.
+
+### Rejected
+
+- **`P.positions`.** An alias for the default axis; see §9 above.
+- **A `Bijection` trait or a `direction` flag on `Index`.** Two forms share the
+  reference half and differ by one rule. A flag would put a branch in shared
+  code to save one function; a trait would abstract over two implementations
+  where one is a strict superset of the other.
+- **Making the codomain a filtering mask.** The codomain mask renumbers rather
+  than filters, because the mapping is stored once, on the domain. Treating it
+  as a second filterable member would delete values from a list that does not
+  exist.
+- **Keeping the bijection guard as documentation.** A comment says the same
+  thing without implying it is checked.
+
+### Coverage, stated honestly
+
+Detectors per injected fault, on the shipped code:
+
+| fault | detectors | benchcases move |
+| --- | --- | --- |
+| image induction disabled | 5 | yes |
+| preimage induction skipped for permutations | 2 | yes |
+| final renumbering skipped for permutations | 5 | yes |
+| image reads the projected, not original, mapping | 3 | yes |
+| image rule drops the occurrence prefix | 1 | no |
+| worklist halts before convergence | 1 | no |
+| bijection re-check removed | 0 | no |
+
+The last three are the informative rows. Occurrence-prefix handling and
+convergence each have a single detector because each needs a schema shape no
+other test has -- a permutation inside a `repeat`, and two producers in series.
+The zero is why that guard is gone.

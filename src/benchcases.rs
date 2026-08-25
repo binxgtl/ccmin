@@ -508,6 +508,70 @@ index I[2] into N
         Pred::Always,
     );
 
+    // --- permutations -----------------------------------------------------
+    // The section 9 litmus schema. Pinning a weight pins a codomain value,
+    // which propagates back through the preimage to the domain.
+    add(
+        "permutation_litmus",
+        Some(
+            "int N in 1..10
+permutation P[N]
+array Colour[N] in 0..999
+             array Weight[P.values] in 0..999
+",
+        ),
+        Shape::Auto,
+        "5
+3 5 1 4 2
+11 12 13 14 15
+71 72 73 74 75
+"
+        .into(),
+        Pred::ContainsAll(&[74]),
+    );
+    // One permutation declaration, two instances, independent masks.
+    add(
+        "permutation_nested_instances",
+        Some(
+            "int T in 1..3
+repeat T {
+  int N in 1..10
+  permutation P[N]
+}
+",
+        ),
+        Shape::Auto,
+        "2
+3
+2 3 1
+3
+3 1 2
+"
+        .into(),
+        Pred::MinTokens(5),
+    );
+    // Three producers over one schema, converging on one fixed point.
+    add(
+        "permutation_with_graph_and_index",
+        Some(
+            "int N in 1..10
+int M in 0..20
+graph E[M] vertices N
+             index I[M] into N
+permutation P[N]
+",
+        ),
+        Shape::Auto,
+        "4 2
+1 2
+3 4
+1 3
+2 1 4 3
+"
+        .into(),
+        Pred::MinTokens(6),
+    );
+
     // --- the unstructured fallback --------------------------------------
     add(
         "raw_tokens",
@@ -758,6 +822,9 @@ fn corpus_covers_every_reduction_path() {
         "graph_literal_edge_count",
         "tree_schema_labels",
         "tree_schema_index_pins",
+        "permutation_litmus",
+        "permutation_nested_instances",
+        "permutation_with_graph_and_index",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

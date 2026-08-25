@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `permutation_with_graph_and_index`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 12
+final_tokens = 6
+oracle_calls = 26
+predicate_holds = true
+[input]
+4 0
+
+2 1 4 3

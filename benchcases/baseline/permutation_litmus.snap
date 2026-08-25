@@ -1,0 +1,12 @@
+# ccmin baseline snapshot for `permutation_litmus`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 16
+final_tokens = 4
+oracle_calls = 20
+predicate_holds = true
+[input]
+1
+1
+0
+74

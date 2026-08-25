@@ -87,6 +87,9 @@ fails if one is dropped.
 | `graph_literal_edge_count` | a fixed count that cannot absorb a lost edge |
 | `tree_schema_labels` | a vertex-labelled tree pruning in step |
 | `tree_schema_index_pins` | references pinning a tree against pruning |
+| `permutation_litmus` | a bijection propagating both directions |
+| `permutation_nested_instances` | one bijection per repeat instance |
+| `permutation_with_graph_and_index` | three producers, one fixed point |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with
