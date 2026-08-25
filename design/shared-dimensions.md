@@ -1,7 +1,7 @@
 # Shared dimensions — design note for v0.5
 
-Status: revision 8. Implementation under way; the cascade engine, both
-relation forms and the shared seams between them are built.
+Status: revision 9. Implementation under way; every reduction path now runs
+through the cascade engine, including trees.
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
 count-shrink propagation and where independence lives. Revision 4 fixed two
@@ -12,18 +12,39 @@ revision got wrong is kept in §13 to §18 rather than folded in silently.
 Revision 7 separates an induced *selection* from a cardinality *requirement*,
 after the first real cascade made the difference concrete. Revision 8
 records the abstraction that two relation forms actually justified, and the
-four larger ones they did not.
+four larger ones they did not. Revision 9 routes tree pruning through the
+same pipeline, which removed the last bespoke reducer and fixed a live bug.
 
-Four sentences the implementation has to keep true throughout:
+Five sentences the implementation has to keep true throughout:
 
 > **A Count never carries identity.
 > An Axis never owns cardinality.
 > A Relation never increases a keep-set.
-> An arena node never holds instance state.**
+> An arena node never holds instance state.
+> Propagation determines what survives; projection only materialises the
+> already-decided final state.**
 
-Every architectural correction across six revisions has been a violation of one
-of them. The fourth was added by revision 6 and is the first one found by
-writing code rather than by reading the document.
+Every architectural correction so far has been a violation of one of them. The
+fourth was added by revision 6 and the fifth by revision 9, and both were found
+by writing code rather than by reading the document. The fifth is the one the
+tree path violated for four revisions without anyone noticing: pruning wrote its
+result directly, so for a tree, projection *was* the decision.
+
+### Positions and labels
+
+Two numberings appear throughout and are deliberately never mixed:
+
+```text
+position   zero-based, internal   an index into an axis's current domain;
+                                  what a keep-mask contains
+label      one-based, in the file what a reference value holds, and what a
+                                  vertex is called in an edge line
+```
+
+A mask of `[0, 2]` keeps the first and third positions, which render as labels
+`1` and `2` after compaction. Conversion happens at exactly two places: reading
+a reference (`label - 1`) and renumbering one after the fixed point
+(`position within the survivors, + 1`). Everywhere else is positions.
 
 The model in one line:
 
@@ -265,6 +286,14 @@ treated as one" of the sort §13 to §17 record:
 InducedSelection(axis occurrence, mask)   determines identity AND cardinality
 RequireCardinality(axis occurrence, k)    determines size only
 ```
+
+A related distinction, on the value side: **an `index` entry is an identity, not
+a magnitude.** Its value names a position; it is not a number with a size that
+could usefully be made smaller. The value pass therefore never touches one --
+driving a reference toward zero would put it outside `1..=N` and produce an
+input that cannot be re-parsed. This falls out of matching on the declaration
+rather than the value, and is tested rather than assumed. It is the same
+distinction as `int K in 1..N` versus `index I[K] into N`, one level down.
 
 A vertex selection induces a **selection** on the edge axis: not "keep two
 edges" but "keep edges 0, 3 and 4". Encoding it as a cardinality requirement
@@ -742,7 +771,16 @@ property of an array; it is which axis the array points at (§6).
 7. Generalise validate / induce once two relation forms      done
    exist to prove the abstraction. One induce seam, one
    emit path, one shared validation rule.
+8. Route tree pruning through the same pipeline.             done
+   The last bespoke reducer; fixed a live bug and made
+   vertex-labelled trees expressible.
 ```
+
+Step 8 was not on the numbered list. Step 6 is the only item that was, and it is
+blocked, so the choice came from asking which architectural boundary was least
+proven. That was section 6's claim that a specialised *generator* can coexist
+with shared *validity*, which nothing tested because the only specialised
+generator never reached the shared path.
 
 The order changed at step 3. Earlier revisions put `Index` before the cascade;
 building it first would have meant writing `induce` with no caller that
@@ -1019,3 +1057,67 @@ test *of* it. The nested-instance test asserted that a replayed mask keeps `E`
 and `W` consistent, which a replayed mask does: it projects both wrongly, but
 equally. Only pinning which edge survived caught it, and until then the
 benchcases were the sole detector. Assert identity, not just consistency.
+
+---
+
+## 19. What routing the tree exposed
+
+Tree pruning was the last reduction path that did not go through the cascade
+engine: it wrote the pruned tree and called `resync`. That was a live bug, not
+an untidiness. This schema is legal --
+
+```text
+int N in 2..10
+tree E vertices N
+index I[2] into N
+```
+
+-- and pruning it produced references to vertices that no longer existed:
+
+```text
+2
+1 2
+5 1        <- vertex 5 is gone
+```
+
+which does not re-parse. Nothing caught it because the index rule was never
+consulted, `renumber_indices` never ran, and the validate rule never fired. All
+three live in `project_fixpoint`, which the tree path skipped.
+
+Two things the fix settled:
+
+**Section 6's claim holds.** A specialised generator can coexist with shared
+validity. Leaf pruning stays exactly as it was -- only leaf subsets, iterated as
+pruning exposes new leaves -- and everything after it is the same path every
+other selection takes. The generator produces masks; it no longer produces
+results.
+
+**A tree's edge count is derived, not declared, and projection has to know
+that.** The shared validate rule rejects a kept edge whose endpoint is gone,
+which is right for a graph whose edge count is a real axis: the loss has nowhere
+to go. A tree's edge count is implied by its vertex count, so the loss is
+absorbed by definition, and the surviving edges are simply whatever the vertex
+selection leaves. Getting this wrong makes trees stop pruning entirely rather
+than prune wrongly -- a benchcase catches it.
+
+Sharing a vertex count is legal as a result, so the last special case in
+validation is gone and `Uses` collapsed back to a plain set of derived names.
+
+### Rejected
+
+- **A `SelectionConstraint` enum.** Section 6 describes constraints composing as
+  an intersection, and `Connected` would be its first variant. It has exactly
+  one inhabitant, so it would be an enum with one arm justified by nothing.
+  Connectivity is instead enforced where the tree is materialised, next to the
+  reference check, which is where the other validity rule already lives.
+- **Making the tree generator general.** Producing arbitrary connected subsets
+  rather than leaf prunings would widen what reduction can reach, but it is a
+  search-quality change, not a correctness one, and this step was neither.
+- **Leaving the bypass and special-casing `index` beside a tree.** That would
+  have fixed the symptom and kept the last reducer off the shared path, which is
+  the arrangement that hid the bug in the first place.
+
+One honest note on coverage. The connectivity check has a single detector, a
+test that hands it a disconnected mask directly. Leaf pruning cannot generate
+one, so nothing else reaches it -- the same status as the dangling-reference
+guard, and worth stating rather than implying the corpus covers it.

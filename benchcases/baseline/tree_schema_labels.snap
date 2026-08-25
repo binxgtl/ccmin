@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `tree_schema_labels`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 11
+final_tokens = 5
+oracle_calls = 27
+predicate_holds = true
+[input]
+2
+1 2
+0 77

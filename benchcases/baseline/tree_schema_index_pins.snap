@@ -1,0 +1,14 @@
+# ccmin baseline snapshot for `tree_schema_index_pins`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 11
+final_tokens = 11
+oracle_calls = 0
+predicate_holds = true
+[input]
+5
+1 2
+2 3
+3 4
+4 5
+5 1

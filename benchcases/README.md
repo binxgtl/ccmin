@@ -85,6 +85,8 @@ fails if one is dropped.
 | `graph_and_index_same_target` | two producers, one target |
 | `index_nested_instances` | one index relation per repeat instance |
 | `graph_literal_edge_count` | a fixed count that cannot absorb a lost edge |
+| `tree_schema_labels` | a vertex-labelled tree pruning in step |
+| `tree_schema_index_pins` | references pinning a tree against pruning |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with

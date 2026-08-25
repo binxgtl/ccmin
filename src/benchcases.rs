@@ -464,6 +464,50 @@ graph E[2] vertices N
         Pred::Always,
     );
 
+    // --- schema trees -----------------------------------------------------
+    // The schema tree path had no corpus coverage at all until pruning was
+    // routed through the shared pipeline. A vertex-labelled tree: labels are
+    // members of the vertex occurrence and follow the pruning.
+    add(
+        "tree_schema_labels",
+        Some(
+            "int N in 2..10
+tree E vertices N
+array Colour[N] in 0..99
+",
+        ),
+        Shape::Auto,
+        "4
+1 2
+1 3
+3 4
+10 20 30 77
+"
+        .into(),
+        Pred::ContainsAll(&[77]),
+    );
+    // An index into the vertex axis with a literal length: a prune that would
+    // strand a reference has nowhere to put the loss and must be rejected.
+    add(
+        "tree_schema_index_pins",
+        Some(
+            "int N in 2..10
+tree E vertices N
+index I[2] into N
+",
+        ),
+        Shape::Auto,
+        "5
+1 2
+2 3
+3 4
+4 5
+5 1
+"
+        .into(),
+        Pred::Always,
+    );
+
     // --- the unstructured fallback --------------------------------------
     add(
         "raw_tokens",
@@ -712,6 +756,8 @@ fn corpus_covers_every_reduction_path() {
         "graph_and_index_same_target",
         "index_nested_instances",
         "graph_literal_edge_count",
+        "tree_schema_labels",
+        "tree_schema_index_pins",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

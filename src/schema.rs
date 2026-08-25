@@ -340,10 +340,9 @@ pub fn parse_schema(text: &str) -> Result<Rc<Schema>, String> {
         return Err("schema is empty".into());
     }
 
-    let mut uses = Uses::default();
+    let mut derived = HashSet::new();
     let mut all_names = HashSet::new();
-    validate(&items, &mut uses, &mut all_names)?;
-    let derived = uses.derived;
+    validate(&items, &mut derived, &mut all_names)?;
 
     let mut counts = Vec::new();
     let mut axes = Vec::new();
@@ -614,17 +613,9 @@ fn value_ref(no: usize, token: &str) -> Result<Ref, String> {
 
 // ---- validation ----------------------------------------------------------
 
-/// What each name is used for while validating. Sharing a count is legal;
-/// sharing one that *cascades* into another axis is not, yet.
-#[derive(Default)]
-struct Uses {
-    derived: HashSet<String>,
-    cascading: HashSet<String>,
-}
-
 fn validate(
     items: &[Decl],
-    uses: &mut Uses,
+    derived: &mut HashSet<String>,
     all_names: &mut HashSet<String>,
 ) -> Result<(), String> {
     // Ints usable as a count in this block. Restricting count references to the
@@ -639,57 +630,42 @@ fn validate(
             }
         }
 
-        let mut use_count =
-            |r: &Ref, role: &str, owner: &str, cascades: bool| -> Result<(), String> {
-                let Ref::Name(n) = r else { return Ok(()) };
-                if !ints_here.contains_key(n) {
-                    return Err(format!(
-                        "`{owner}` uses `{n}` as its {role}, but `{n}` is not an `int` declared \
-                         earlier in the same block"
-                    ));
-                }
-                let shared = !uses.derived.insert(n.clone());
-                if cascades {
-                    uses.cascading.insert(n.clone());
-                }
-                // Sharing is what lets `array A[N]` and `array B[N]` coexist:
-                // one axis, one selection, both projected together. A graph's
-                // vertex selection additionally induces one on its edge axis,
-                // which is handled. A tree's is not: pruning runs a sequence of
-                // selections against a changing leaf set, and fanning that out
-                // to co-sized members is a separate job.
-                if shared && uses.cascading.contains(n) {
-                    return Err(format!(
-                        "`{n}` is a tree's vertex count and also sizes something else; tree \
-                         pruning is a sequence of selections against a changing leaf set, and \
-                         fanning that out is not implemented yet"
-                    ));
-                }
-                Ok(())
-            };
+        // Sharing a count is simply legal: one axis, one selection, every
+        // member projected together. Every form that induces on another axis
+        // now does so through the shared pipeline, so nothing is left to
+        // special-case here.
+        let mut use_count = |r: &Ref, role: &str, owner: &str| -> Result<(), String> {
+            let Ref::Name(n) = r else { return Ok(()) };
+            if !ints_here.contains_key(n) {
+                return Err(format!(
+                    "`{owner}` uses `{n}` as its {role}, but `{n}` is not an `int` declared \
+                     earlier in the same block"
+                ));
+            }
+            derived.insert(n.clone());
+            Ok(())
+        };
 
         match decl {
             Decl::Int { name, bounds } => {
                 ints_here.insert(name.clone(), *bounds);
             }
-            Decl::Array { name, len, .. } => use_count(len, "length", name, false)?,
+            Decl::Array { name, len, .. } => use_count(len, "length", name)?,
             Decl::Matrix {
                 name, rows, cols, ..
             } => {
-                use_count(rows, "row count", name, false)?;
-                use_count(cols, "column count", name, false)?;
+                use_count(rows, "row count", name)?;
+                use_count(cols, "column count", name)?;
             }
-            Decl::Tree { name, verts } => use_count(verts, "vertex count", name, true)?,
+            Decl::Tree { name, verts } => use_count(verts, "vertex count", name)?,
             Decl::Graph { name, edges, verts } => {
-                use_count(edges, "edge count", name, false)?;
-                // A graph vertex selection induces one on the edge axis, so
-                // sharing it is fine.
-                use_count(verts, "vertex count", name, false)?;
+                use_count(edges, "edge count", name)?;
+                use_count(verts, "vertex count", name)?;
             }
-            Decl::Index { name, len, .. } => use_count(len, "length", name, false)?,
+            Decl::Index { name, len, .. } => use_count(len, "length", name)?,
             Decl::Repeat { count, body } => {
-                use_count(count, "repeat count", "repeat", false)?;
-                validate(body, uses, all_names)?;
+                use_count(count, "repeat count", "repeat")?;
+                validate(body, derived, all_names)?;
             }
         }
     }
@@ -1779,11 +1755,26 @@ fn apply_masks(value: &Value, ops: &[(Role, Vec<usize>)]) -> Option<Value> {
             .map(|(_, mask)| mask.as_slice())
     };
     Some(match value {
-        Value::Graph(g) => Value::Graph(project_graph(
-            g,
-            find(Role::GraphVertices),
-            find(Role::Edges),
-        )?),
+        Value::Graph(g) => {
+            let vertices = find(Role::GraphVertices).or_else(|| find(Role::TreeVertices));
+            // A tree's edge count is implied by its vertex count rather than
+            // declared, so the surviving edges are whatever the vertex
+            // selection leaves. A graph's edge count is a real axis, so its
+            // mask has to come from the propagation instead.
+            let edges: Option<Vec<usize>> = match find(Role::TreeVertices) {
+                Some(kept) => Some(induced_edge_keep(g, kept)),
+                None => find(Role::Edges).map(<[usize]>::to_vec),
+            };
+            let projected = project_graph(g, vertices, edges.as_deref())?;
+            if find(Role::TreeVertices).is_some() && !is_tree(&projected) {
+                // The leaf-pruning generator is supposed to guarantee this.
+                // Checking it where the tree is materialised makes the
+                // guarantee observable rather than assumed, and keeps validity
+                // on the shared path even though generation is specialised.
+                return None;
+            }
+            Value::Graph(projected)
+        }
         Value::Matrix(grid) => {
             let mut out = grid.clone();
             if let Some(rows) = find(Role::Rows) {
@@ -1931,59 +1922,92 @@ fn occurrence_extent(data: &SchemaData, occ: &Occurrence) -> Option<usize> {
     agreed
 }
 
+/// Reduce a tree by pruning leaves.
+///
+/// The *generator* is specialised -- only leaf subsets keep a tree connected,
+/// and pruning exposes new leaves, so this is a sequence of selections rather
+/// than one. Everything after it is the shared path: each candidate goes
+/// through `project_occurrence`, so co-sized members are projected, index
+/// references into the vertex axis are dropped and renumbered, and the result
+/// is validated like any other candidate.
+///
+/// Pruning used to write the tree directly and call `resync`, bypassing
+/// propagation. Beside `index I[2] into N` that was a live bug: references
+/// were neither dropped nor renumbered, and the reduced input could not be
+/// re-parsed.
 fn prune_tree(
     data: &mut SchemaData,
     occ: &Occurrence,
     min: usize,
     accept: &mut dyn FnMut(&SchemaData) -> bool,
 ) -> bool {
-    let Some(member) = occ.members.first() else {
+    let key = (occ.prefix.clone(), occ.axis);
+    let Some(member) = occ.members.iter().find(|m| m.role == Role::TreeVertices) else {
         return false;
     };
     let path = occ.path_of(member);
-    let Some(Value::Graph(tree)) = value_at(&data.values, &path).cloned() else {
-        return false;
-    };
 
-    let mut current = tree;
+    let mut current = data.clone();
     let mut changed = false;
     loop {
-        let leaves = current.leaves();
-        if leaves.len() < 2 || current.n <= min {
+        let Some(Value::Graph(tree)) = value_at(&current.values, &path).cloned() else {
+            break;
+        };
+        let leaves = tree.leaves();
+        if leaves.len() < 2 || tree.n <= min {
             break;
         }
-        let mut is_leaf = vec![false; current.n + 1];
+        let mut is_leaf = vec![false; tree.n + 1];
         for leaf in &leaves {
             is_leaf[*leaf] = true;
         }
-        let internal: Vec<usize> = (1..=current.n).filter(|v| !is_leaf[*v]).collect();
-        let base = current.clone();
+        let internal: Vec<usize> = (1..=tree.n).filter(|v| !is_leaf[*v]).collect();
         // Keep enough leaves to satisfy the declared vertex floor.
         let min_leaves = min.saturating_sub(internal.len());
-        let build = |keep: &[usize]| {
+
+        // Re-derived each round: the previous projection changed the data the
+        // occurrences describe.
+        let all = current.all_occurrences();
+        let Some(round) = all.iter().find(|o| o.prefix == key.0 && o.axis == key.1) else {
+            break;
+        };
+
+        // Vertex labels are one-based in the file; masks are zero-based
+        // positions on the axis.
+        let mask_of = |kept_labels: &[usize]| -> Vec<usize> {
+            let mut mask: Vec<usize> = kept_labels.iter().map(|label| label - 1).collect();
+            mask.sort_unstable();
+            mask
+        };
+        let candidate_labels = |chosen: &[usize]| -> Vec<usize> {
             let mut kept = internal.clone();
-            kept.extend(keep.iter().filter_map(|&i| leaves.get(i).copied()));
+            kept.extend(chosen.iter().filter_map(|&i| leaves.get(i).copied()));
             kept.sort_unstable();
-            base.induced(&kept)
+            kept
         };
 
         let positions: Vec<usize> = (0..leaves.len()).collect();
-        let kept_leaves = ddmin_min_len(&positions, min_leaves, |candidate| {
-            let mut trial = data.clone();
-            put(&mut trial, &path, Value::Graph(build(candidate)));
-            trial.resync();
-            accept(&trial)
+        let kept_leaves = ddmin_min_len(&positions, min_leaves, |chosen| {
+            let mask = mask_of(&candidate_labels(chosen));
+            match project_occurrence(&current, round, &mask, &all) {
+                Some(trial) => accept(&trial),
+                None => false,
+            }
         });
         if kept_leaves.len() == leaves.len() {
             break;
         }
-        current = build(&kept_leaves);
+
+        let mask = mask_of(&candidate_labels(&kept_leaves));
+        let Some(next) = project_occurrence(&current, round, &mask, &all) else {
+            break;
+        };
+        current = next;
         changed = true;
     }
 
     if changed {
-        put(data, &path, Value::Graph(current));
-        data.resync();
+        *data = current;
     }
     changed
 }
@@ -2475,17 +2499,106 @@ mod tests {
         assert_eq!(weights_of(&second, 0), vec![10, 20, 30]);
     }
 
-    /// A graph's vertex count may now be shared, because the vertex selection
-    /// induces the edge one. A tree's may not: pruning is a sequence of
-    /// selections against a changing leaf set.
+    /// Every vertex count is shareable now that pruning goes through the same
+    /// pipeline as everything else. A vertex-labelled tree is the case this
+    /// unlocks: the labels follow the pruning because they are members of the
+    /// same occurrence.
     #[test]
-    fn graph_vertex_counts_may_be_shared_but_tree_ones_may_not() {
-        parse_schema("int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\narray D[N] in 0..9\n")
-            .expect("a graph vertex count is shareable");
+    fn a_tree_vertex_count_can_be_shared_with_its_labels() {
+        let text = "int N in 2..10\ntree E vertices N\narray Colour[N] in 0..99\n";
+        let data = build(text, "4\n1 2\n1 3\n3 4\n10 20 30 77\n");
 
-        let err =
-            parse_schema("int N in 2..10\ntree E vertices N\narray D[N] in 0..9\n").unwrap_err();
-        assert!(err.contains("not implemented yet"), "{err}");
+        // Vertex 4 carries colour 77, so it has to survive.
+        let reduced = reduce(&data, |t| ints(t).contains(&77));
+
+        let (Value::Int(n), Value::Graph(tree), Value::Array(colour)) =
+            (&reduced.values[0], &reduced.values[1], &reduced.values[2])
+        else {
+            panic!("unexpected shape")
+        };
+        assert_eq!(tree.n as i64, *n, "the count disagrees with the tree");
+        assert_eq!(colour.len(), tree.n, "labels lost sync with vertices");
+        assert_eq!(tree.edges.len(), tree.n - 1, "no longer a tree");
+        assert!(colour.contains(&77), "the pinned label is gone");
+        assert_eq!(
+            parse_input(&reduced.schema, &reduced.render()).unwrap(),
+            reduced
+        );
+
+        parse_schema("int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\narray D[N] in 0..9\n")
+            .expect("a graph vertex count is shareable too");
+    }
+
+    /// The tree's validity check, exercised directly. Leaf pruning cannot
+    /// generate a disconnected subset, so nothing in normal operation reaches
+    /// this -- it is a guard on the generator's guarantee, and only a
+    /// hand-built mask makes it observable.
+    #[test]
+    fn a_disconnected_vertex_selection_rejects() {
+        let text = "int N in 2..10\ntree E vertices N\n";
+        let data = build(text, "3\n1 2\n2 3\n");
+        let (occ, all) = occurrence_for(&data, "N");
+
+        // Keeping the two ends of a path drops the middle, so the survivors
+        // are no longer connected and no longer a tree.
+        assert!(
+            project_occurrence(&data, &occ, &[0, 2], &all).is_none(),
+            "a disconnected selection must reject"
+        );
+        // Keeping an end and the middle is still a tree.
+        assert!(project_occurrence(&data, &occ, &[0, 1], &all).is_some());
+    }
+
+    /// Regression. Pruning used to write the tree directly and call `resync`,
+    /// bypassing propagation, so an `index` into the vertex axis was neither
+    /// induced nor renumbered: the reduced input referenced vertices that no
+    /// longer existed and could not be re-parsed.
+    ///
+    /// With a literal index length there is no axis to carry an induced
+    /// selection, so a prune that kills a referenced vertex has nowhere to put
+    /// the loss and is rejected outright.
+    #[test]
+    fn pruning_a_tree_cannot_strand_an_index_reference() {
+        let text = "int N in 2..10\ntree E vertices N\nindex I[2] into N\n";
+        let data = build(text, "5\n1 2\n2 3\n3 4\n4 5\n5 1\n");
+
+        let reduced = reduce(&data, |_| true);
+        let rendered = reduced.render();
+
+        // Both ends of the path are referenced, so nothing may be pruned.
+        assert_eq!(ints(&rendered), vec![5, 1, 2, 2, 3, 3, 4, 4, 5, 5, 1]);
+        assert_eq!(
+            parse_input(&reduced.schema, &rendered).unwrap(),
+            reduced,
+            "a stranded reference would fail to re-parse"
+        );
+    }
+
+    /// The same schema with a *counted* index: the loss now has somewhere to
+    /// go, so references are dropped and the survivors renumbered.
+    #[test]
+    fn pruning_a_tree_drops_and_renumbers_counted_references() {
+        let text = "int N in 2..10\ntree E vertices N\nint K in 0..10\n\
+                    index I[K] into N\n";
+        let data = build(text, "5\n1 2\n2 3\n3 4\n4 5\n2\n5 1\n");
+
+        let reduced = reduce(&data, |_| true);
+        let rendered = reduced.render();
+
+        let (Value::Int(n), Value::Graph(tree), Value::Int(k), Value::Array(refs)) = (
+            &reduced.values[0],
+            &reduced.values[1],
+            &reduced.values[2],
+            &reduced.values[3],
+        ) else {
+            panic!("unexpected shape")
+        };
+        assert_eq!(tree.n as i64, *n);
+        assert_eq!(refs.len() as i64, *k);
+        for r in refs {
+            assert!(*r >= 1 && r <= n, "reference {r} outside 1..={n}");
+        }
+        assert_eq!(parse_input(&reduced.schema, &rendered).unwrap(), reduced);
     }
 
     #[test]
