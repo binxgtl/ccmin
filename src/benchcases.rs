@@ -572,6 +572,69 @@ permutation P[N]
         Pred::MinTokens(6),
     );
 
+    // --- dynamic numeric bounds -------------------------------------------
+    // Every deletion is illegal until the values come down, so this only
+    // reduces if the schedule really does retry structure after the value
+    // pass. The oracle count is the evidence.
+    add(
+        "dynamic_bound_blocks_then_unblocks",
+        Some(
+            "int N in 1..10
+array A[N] in 1..N
+",
+        ),
+        Shape::Auto,
+        "6
+6 6 6 6 6 6
+"
+        .into(),
+        Pred::Always,
+    );
+    // A dynamic bound sharing a schema with all three identity producers.
+    add(
+        "dynamic_bound_beside_relations",
+        Some(
+            "int N in 1..10
+int M in 0..20
+graph E[M] vertices N
+             index I[M] into N
+permutation P[N]
+array W[N] in 1..N
+",
+        ),
+        Shape::Auto,
+        "4 2
+1 2
+3 4
+1 3
+2 1 4 3
+1 2 3 4
+"
+        .into(),
+        Pred::MinTokens(6),
+    );
+    // One bound per repeat instance, resolved against its own count.
+    add(
+        "dynamic_bound_in_repeat",
+        Some(
+            "int T in 1..3
+repeat T {
+  int N in 1..10
+  array A[N] in 1..N
+}
+",
+        ),
+        Shape::Auto,
+        "2
+3
+3 3 3
+2
+2 2
+"
+        .into(),
+        Pred::MinTokens(4),
+    );
+
     // --- the unstructured fallback --------------------------------------
     add(
         "raw_tokens",
@@ -825,6 +888,9 @@ fn corpus_covers_every_reduction_path() {
         "permutation_litmus",
         "permutation_nested_instances",
         "permutation_with_graph_and_index",
+        "dynamic_bound_blocks_then_unblocks",
+        "dynamic_bound_beside_relations",
+        "dynamic_bound_in_repeat",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

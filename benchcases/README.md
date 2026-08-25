@@ -90,6 +90,9 @@ fails if one is dropped.
 | `permutation_litmus` | a bijection propagating both directions |
 | `permutation_nested_instances` | one bijection per repeat instance |
 | `permutation_with_graph_and_index` | three producers, one fixed point |
+| `dynamic_bound_blocks_then_unblocks` | a count bound that only yields after value shrinking |
+| `dynamic_bound_beside_relations` | a numeric bound sharing a schema with all three producers |
+| `dynamic_bound_in_repeat` | one dynamic bound per instance |
 | `raw_tokens` | the unstructured fallback |
 
 `graph_isolated_vertices` is the one to keep if you keep only one. `N = 4` with

@@ -1,7 +1,8 @@
 # Shared dimensions — design note for v0.5
 
-Status: revision 10. Implementation under way; every reduction path runs
-through the cascade engine, and the first bidirectional relation is built.
+Status: revision 11. Implementation under way; every reduction path runs
+through the cascade engine, the first bidirectional relation is built, and the
+first *non*-relational dependency is built beside it.
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
 count-shrink propagation and where independence lives. Revision 4 fixed two
@@ -795,6 +796,9 @@ it. The implementation tests the static-bound analogue instead and asserts that
 9. Permutation as the first bidirectional relation.          done
    Producer #3, and the first that induces *into* an axis
    it is also induced *from*.
+10. Count-referenced numeric bounds.                         done
+   Not a producer at all: a value dependency that takes no
+   part in propagation. See section 21.
 ```
 
 Step 8 was not on the numbered list. Step 6 is the only item that was, and it is
@@ -1178,20 +1182,49 @@ this one.
 ### A guard that could not be made to fire
 
 `renumber_indices` briefly re-checked that a renumbered permutation was still a
-bijection. It was deliberately broken under five separate faults -- image rule
-disabled, preimage rule disabled, renumbering skipped, propagation halted
-before convergence, and the guard alone -- and in every case the set of failing
-tests was byte-identical with and without it.
+bijection. It was removed. Two separate things justify that, and they are worth
+keeping separate, because one of them is evidence and the other is a reason.
 
-It is structurally unreachable, not merely uncovered. Read-time validation
-rejects a non-bijective *input*. For *candidates*, the image and preimage rules
-are exact inverses of one stored mapping, so every mask pair the worklist can
-reach already satisfies `codomain == image(domain)`. Narrowing that arrives
-from elsewhere still passes through one of those two rules before projection.
+**The empirical part.** The guard was deliberately broken under five faults --
+image rule disabled, preimage rule disabled, renumbering skipped, propagation
+halted before convergence, and the guard alone -- and in every case the set of
+failing tests was byte-identical with and without it. That is a measurement. On
+its own it says only "no test I wrote distinguishes these", which is exactly
+the claim an absent test also supports. It is not proof of anything.
 
-It was removed. An assertion that no fault can trip is not a safety net; it is
-a claim about the code that the code cannot check. The claim now lives in a
-comment at the site, next to a pointer here.
+**The argument.** Write the stored mapping as a bijection `s` on `{0..n-1}`;
+read-time validation guarantees it is one. Let `mD` and `mC` be the masks on the
+domain and codomain at projection time.
+
+1. The image rule, run on `mD`, emits `s(mD)` as an induced selection on `C`.
+2. The preimage rule, run on `mC`, emits `s^-1(mC)` as an induced selection on
+   `D`.
+3. Narrowing is intersection-only and the worklist enqueues on any strict
+   shrink, so at a fixed point no rule can shrink anything further. From (1)
+   that gives `mC` subset of `s(mD)`; from (2), `mD` subset of `s^-1(mC)`.
+4. Applying `s` to the second containment gives `s(mD)` subset of `mC`. With the
+   first, `mC = s(mD)` exactly.
+5. `s` is injective, so `|mD| = |mC|`. Renumbering maps `mD` and `mC`
+   order-isomorphically onto `1..=k` for the same `k`, and the composite is a
+   bijection on `1..=k`.
+
+So at a fixed point the guard is *provably* redundant, and the proof rests on
+convergence -- which is not free, and is what the "worklist halts before
+convergence" injection now tests.
+
+**What the argument does not cover.** Step 3 assumes a fixed point. Off it, the
+proof does not apply, yet the guard still never fired. The reason is narrower
+and worth stating as the weaker claim it is: whichever of `D` or `C` narrows
+first, the corresponding rule is emitted while processing that same occurrence,
+so either both masks are present and matched, or the partner mask is absent
+entirely and `masks.get` skips renumbering. That is an argument about the
+current two rules, not a theorem about the engine, and a third rule touching
+either axis would invalidate it. If one arrives, this is the paragraph to
+re-read.
+
+An assertion that no fault can trip is not a safety net; it is a claim about the
+code that the code cannot check. The claim now lives in a comment at the site,
+next to a pointer here.
 
 ### The gap this step actually found
 
@@ -1249,3 +1282,127 @@ The last three are the informative rows. Occurrence-prefix handling and
 convergence each have a single detector because each needs a schema shape no
 other test has -- a permutation inside a `repeat`, and two producers in series.
 The zero is why that guard is gone.
+
+
+---
+
+## 21. Numeric bounds are not identity
+
+`array A[N] in 1..N` was section 9's own example and was not expressible: bounds
+took integer literals. Building it is the first dependency in this design that
+is **not** a relation, and its value is mostly in what it declines to reuse.
+
+### What the dependency is
+
+`in 1..N` constrains a *magnitude* by the current value of `N`. It is not a
+reference into `N`. The distinction is not stylistic:
+
+- A reference names an element. When `N` narrows, the element it names either
+  survives -- and the label is rewritten to the survivor's new position -- or it
+  does not, and the candidate is rejected. Identity is preserved; the number
+  changes.
+- A magnitude names a quantity. When `N` narrows, nothing about the quantity
+  changes. The number stays; what changes is whether it is still admissible.
+
+`index I[K] into N` and `int X in 1..N` both mention `N` and share nothing else.
+The acceptance suite pins that directly: the same projection renumbers `I` and
+leaves `X` alone.
+
+### It does not participate in propagation
+
+A numeric bound induces no mask, and it is not routed through
+`induced_selections()`. The reason is that it carries no positional information
+whatsoever: `in 1..N` says nothing about *which* positions of anything survive,
+only whether an already-chosen candidate is legal. There is nothing for a
+producer to emit.
+
+The mechanism is one predicate, `dynamic_bounds_hold`, applied where candidates
+are accepted in both passes. That placement -- rather than inside
+`project_fixpoint` -- is deliberate: it covers structural reduction, value
+reduction, tree pruning and any future pass with one rule, and it is the whole
+of the "separate dependency layer" this feature needed. A schema with no dynamic
+bound skips the check entirely, so every previously written schema follows the
+path it always did, which is why all 28 earlier snapshots are byte-identical.
+
+### What happens when `N` shrinks below an existing value
+
+**The candidate is rejected.** Deleting elements can pull `N` under a magnitude
+that `in 1..N` still has to admit; that candidate is not reachable *yet*.
+
+Clamping during projection was the tempting alternative and is wrong. Projection
+already rewrites numbers -- it renumbers references -- so rewriting a magnitude
+looks like more of the same. It is not. Renumbering preserves identity: the same
+element, a new label, and the rendered input still denotes what it denoted.
+Clamping 7 to 3 preserves nothing. It is a value edit performed by a structural
+pass, on a value the oracle never approved changing, and it would silently make
+structural reduction lossy in a way no test of structure would catch.
+
+The third option -- some new dependency mechanism that propagates a value floor
+-- had no producer demanding it and, as below, no problem left to solve.
+
+### The pass-order consequence
+
+Rejection is only correct if the deletion is offered again later. It is, and
+this was checked before the feature was built rather than assumed:
+
+```rust
+for _ in 0..16 {
+    let before = best.clone();
+    best = self.structural(&best);
+    best = self.values(&best);
+    if best == before { break; }
+}
+```
+
+The schedule already alternates and already retries to a fixed point, so a
+structurally infeasible deletion becomes feasible once the value pass has pulled
+the offending magnitudes down, and the next round takes it.
+`structural_shrinking_is_retried_after_the_value_pass` pins this with *static*
+bounds only -- it was written before dynamic bounds existed, precisely so that
+the schedule and the feature relying on it are not tested by the same code.
+
+**No pass-order change was needed.** That is the honest answer, and it is the
+first time in this design that an existing mechanism turned out to be enough.
+
+One wart the injections exposed: `Shrinker::run` and the `reduce` test helper
+contain the same sixteen-round loop, written twice. Breaking the real one is
+caught by benchcases and no unit test; breaking the helper is caught by three
+unit tests and no benchcase. They agree today. Nothing makes them agree
+tomorrow.
+
+### Rejected
+
+- **A general expression language.** `N-1`, `min(N, 100)`, `2*N`. Every
+  acceptance case for this step is satisfied by a bare name, and an expression
+  grammar would bring parsing, precedence, an AST, and a resolver with no
+  concrete case demanding any of it. A bare name is also the only form for which
+  "the bound is the current value of that count" needs no further explanation.
+- **Named axes, to give `A.values` meaning here.** A count-bounded array has no
+  second axis, because its values are not positions in anything. Reaching for
+  one would be the exact confusion this section exists to prevent.
+- **Bounds naming a count from an enclosing block.** Rejected for symmetry with
+  the existing rule that a count must be declared in the block it sizes. Same
+  scope rule, same error, one thing to learn.
+- **Resolving names at check time rather than parse time.** Storing the slot
+  makes resolution occurrence-local by construction -- the value is read out of
+  the same block instantiation -- so one `repeat` iteration cannot see another's
+  count. Storing the name would have made that a property of the lookup code
+  instead, which is a thing that can be got wrong; the injection that breaks
+  block resolution is caught by two tests, and it would have needed more.
+- **Clamping, again.** Worth listing twice. It is the design that makes every
+  test pass and quietly destroys the input.
+
+### Coverage
+
+| fault | detectors | benchcases move |
+| --- | --- | --- |
+| dynamic bound never resolves | 8 | yes |
+| block resolution ignores the repeat instance | 2 | yes |
+| candidate validation disabled | 5 | yes |
+| magnitudes renumbered as if references | 4 | yes |
+| retry loop cut to one round (real reducer) | 1 | yes |
+| retry loop cut to one round (test helper) | 3 | no |
+
+The two single-detector rows are the informative ones, and they are informative
+in opposite directions: the real reducer's schedule is covered *only* by
+benchcases, and the helper's *only* by unit tests. Neither reaches the other.

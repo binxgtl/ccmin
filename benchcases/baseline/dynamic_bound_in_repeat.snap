@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `dynamic_bound_in_repeat`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 8
+final_tokens = 4
+oracle_calls = 5
+predicate_holds = true
+[input]
+1
+2
+1 1

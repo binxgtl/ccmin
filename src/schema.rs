@@ -36,13 +36,64 @@ use std::rc::Rc;
 
 // ---- grammar ------------------------------------------------------------
 
+/// One side of a range.
+///
+/// A named side is a *numeric* dependency: `in 1..N` constrains a magnitude by
+/// the current value of `N`. It is emphatically not a reference into `N`, and
+/// nothing here induces a positional mask -- see `Limits` and section 21 of the
+/// design note.
+///
+/// The name is stored as the slot of its `int` within the same block, resolved
+/// once at parse time. That keeps `Bounds` `Copy`, and it makes resolution
+/// occurrence-local for free: the value is read out of the same block
+/// instantiation, so one `repeat` iteration cannot see another's `N`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    Lit(i64),
+    Slot(usize),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bounds {
+    pub lo: Option<Bound>,
+    pub hi: Option<Bound>,
+}
+
+/// A `Bounds` with both sides reduced to numbers, against one block's values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
     pub lo: Option<i64>,
     pub hi: Option<i64>,
 }
 
 impl Bounds {
+    /// Does either side name a count? Only these need re-checking when
+    /// structure shrinks; a literal range cannot be invalidated by deletion.
+    fn is_dynamic(&self) -> bool {
+        matches!(self.lo, Some(Bound::Slot(_))) || matches!(self.hi, Some(Bound::Slot(_)))
+    }
+
+    /// Reduce both sides against the block this declaration lives in. A named
+    /// side that does not resolve to an `int` leaves that side unbounded, which
+    /// is the permissive answer; validation has already rejected the cases
+    /// where that could happen.
+    fn resolve(&self, block: &[Value]) -> Limits {
+        let side = |b: Option<Bound>| match b {
+            None => None,
+            Some(Bound::Lit(v)) => Some(v),
+            Some(Bound::Slot(slot)) => match block.get(slot) {
+                Some(Value::Int(v)) => Some(*v),
+                _ => None,
+            },
+        };
+        Limits {
+            lo: side(self.lo),
+            hi: side(self.hi),
+        }
+    }
+}
+
+impl Limits {
     fn contains(&self, v: i64) -> bool {
         !self.lo.is_some_and(|lo| v < lo) && !self.hi.is_some_and(|hi| v > hi)
     }
@@ -148,6 +199,17 @@ pub enum Decl {
         count: Ref,
         body: Vec<Decl>,
     },
+}
+
+/// The numeric range a declaration constrains its values by. Structural
+/// declarations carry none, which reads as unbounded.
+fn decl_bounds(decl: &Decl) -> Bounds {
+    match decl {
+        Decl::Int { bounds, .. } | Decl::Array { bounds, .. } | Decl::Matrix { bounds, .. } => {
+            *bounds
+        }
+        _ => Bounds::default(),
+    }
 }
 
 impl Decl {
@@ -512,7 +574,8 @@ fn parse_block(
             return Ok(items);
         }
         *cursor += 1;
-        items.push(parse_decl(*no, tokens, lines, cursor)?);
+        let decl = parse_decl(*no, tokens, lines, cursor, &items)?;
+        items.push(decl);
     }
     if nested {
         return Err("unterminated `repeat` block: missing `}`".into());
@@ -525,6 +588,9 @@ fn parse_decl(
     tokens: &[String],
     lines: &[(usize, Vec<String>)],
     cursor: &mut usize,
+    // Everything already declared in this block, so a range may name an
+    // earlier `int`. Sequential parsing is what rules out forward references.
+    items: &[Decl],
 ) -> Result<Decl, String> {
     let at = |msg: String| format!("line {no}: {msg}");
     match tokens[0].as_str() {
@@ -533,7 +599,7 @@ fn parse_decl(
                 return Err(at("`int` needs a name".into()));
             }
             let name = ident(no, &tokens[1])?;
-            let bounds = parse_bounds(no, &tokens[2..])?;
+            let bounds = parse_bounds(no, &tokens[2..], items)?;
             Ok(Decl::Int { name, bounds })
         }
         "array" => {
@@ -544,7 +610,7 @@ fn parse_decl(
                     dims.len()
                 )));
             }
-            let bounds = parse_bounds(no, rest)?;
+            let bounds = parse_bounds(no, rest, items)?;
             Ok(Decl::Array {
                 name,
                 len: dims[0].clone(),
@@ -559,7 +625,7 @@ fn parse_decl(
                     dims.len()
                 )));
             }
-            let bounds = parse_bounds(no, rest)?;
+            let bounds = parse_bounds(no, rest, items)?;
             Ok(Decl::Matrix {
                 name,
                 rows: dims[0].clone(),
@@ -671,7 +737,7 @@ fn parse_vertices(no: usize, tokens: &[String]) -> Result<Ref, String> {
     value_ref(no, &tokens[1])
 }
 
-fn parse_bounds(no: usize, tokens: &[String]) -> Result<Bounds, String> {
+fn parse_bounds(no: usize, tokens: &[String], items: &[Decl]) -> Result<Bounds, String> {
     if tokens.is_empty() {
         return Ok(Bounds::default());
     }
@@ -690,9 +756,11 @@ fn parse_bounds(no: usize, tokens: &[String]) -> Result<Bounds, String> {
         ));
     };
     let (lo_text, hi_text) = (&spec[..dot], &spec[dot + 2..]);
-    let lo = parse_bound_side(no, lo_text)?;
-    let hi = parse_bound_side(no, hi_text)?;
-    if let (Some(lo), Some(hi)) = (lo, hi) {
+    let lo = parse_bound_side(no, lo_text, items)?;
+    let hi = parse_bound_side(no, hi_text, items)?;
+    // Only a literal range can be judged empty here. A named side is whatever
+    // the data says at the time, so emptiness is a runtime condition.
+    if let (Some(Bound::Lit(lo)), Some(Bound::Lit(hi))) = (lo, hi) {
         if lo > hi {
             return Err(format!("line {no}: range `{spec}` is empty ({lo} > {hi})"));
         }
@@ -700,13 +768,35 @@ fn parse_bounds(no: usize, tokens: &[String]) -> Result<Bounds, String> {
     Ok(Bounds { lo, hi })
 }
 
-fn parse_bound_side(no: usize, text: &str) -> Result<Option<i64>, String> {
+/// A range side is a literal or the name of an `int` declared *earlier in the
+/// same block*. The "earlier" and "same block" parts are not restrictions
+/// invented here: they are what makes the value readable when the bound is
+/// checked, both while reading input and while reducing.
+fn parse_bound_side(no: usize, text: &str, items: &[Decl]) -> Result<Option<Bound>, String> {
     if text.is_empty() {
         return Ok(None);
     }
-    text.parse::<i64>()
-        .map(Some)
-        .map_err(|_| format!("line {no}: `{text}` is not an integer"))
+    if let Ok(v) = text.parse::<i64>() {
+        return Ok(Some(Bound::Lit(v)));
+    }
+    if ident(no, text).is_err() {
+        return Err(format!(
+            "line {no}: `{text}` is neither an integer nor a name"
+        ));
+    }
+    match items
+        .iter()
+        .position(|d| matches!(d, Decl::Int { name, .. } if name == text))
+    {
+        Some(slot) => Ok(Some(Bound::Slot(slot))),
+        None if items.iter().any(|d| d.name() == Some(text)) => Err(format!(
+            "line {no}: `{text}` is not an `int`, so it cannot bound a range"
+        )),
+        None => Err(format!(
+            "line {no}: no `int` named `{text}` is declared before this line in \
+             the same block; a range may only name an earlier `int`"
+        )),
+    }
 }
 
 fn ident(no: usize, token: &str) -> Result<String, String> {
@@ -906,7 +996,10 @@ fn read_block(
 ) -> Result<Vec<Value>, String> {
     let mut out = Vec::with_capacity(items.len());
     for decl in items {
-        out.push(read_decl(schema, decl, cursor, current)?);
+        // `out` is this block's values so far. A range may only name an
+        // earlier `int`, so everything a bound can refer to is already in it.
+        let value = read_decl(schema, decl, cursor, current, &out)?;
+        out.push(value);
     }
     Ok(out)
 }
@@ -939,11 +1032,12 @@ fn read_decl(
     decl: &Decl,
     cursor: &mut Cursor,
     current: &mut [i64],
+    block: &[Value],
 ) -> Result<Value, String> {
     match decl {
         Decl::Int { name, bounds } => {
             let v = cursor.take(name)?;
-            check_bound(v, bounds, name)?;
+            check_bound(v, &bounds.resolve(block), name)?;
             if let Some(id) = schema.count_id(name) {
                 current[id] = v;
             }
@@ -954,7 +1048,7 @@ fn read_decl(
             let mut arr = Vec::with_capacity(n);
             for _ in 0..n {
                 let v = cursor.take(name)?;
-                check_bound(v, bounds, name)?;
+                check_bound(v, &bounds.resolve(block), name)?;
                 arr.push(v);
             }
             Ok(Value::Array(arr))
@@ -972,7 +1066,7 @@ fn read_decl(
                 let mut row = Vec::with_capacity(c);
                 for _ in 0..c {
                     let v = cursor.take(name)?;
-                    check_bound(v, bounds, name)?;
+                    check_bound(v, &bounds.resolve(block), name)?;
                     row.push(v);
                 }
                 grid.push(row);
@@ -1059,7 +1153,7 @@ fn endpoint(value: i64, n: usize, owner: &str) -> Result<usize, String> {
     v.ok_or_else(|| format!("`{owner}`: endpoint {value} is outside 1..={n}"))
 }
 
-fn check_bound(v: i64, bounds: &Bounds, name: &str) -> Result<(), String> {
+fn check_bound(v: i64, bounds: &Limits, name: &str) -> Result<(), String> {
     if bounds.contains(v) {
         Ok(())
     } else {
@@ -1301,6 +1395,20 @@ fn resync_block(schema: &Schema, items: &[Decl], values: &mut [Value]) {
 /// iteration and the remainder continues inside it. Leaf paths have odd length.
 type Path = Vec<usize>;
 
+/// The values of one block instantiation. `prefix` is empty for the top
+/// level, or `..., repeat_decl, iteration` for one pass of a `repeat` body --
+/// which is exactly why a bound resolved through it cannot see a sibling
+/// iteration's count.
+fn block_values_at<'a>(values: &'a [Value], prefix: &[usize]) -> Option<&'a [Value]> {
+    let Some((&iteration, head)) = prefix.split_last() else {
+        return Some(values);
+    };
+    let Value::Repeat(iters) = value_at(values, head)? else {
+        return None;
+    };
+    iters.get(iteration).map(Vec::as_slice)
+}
+
 fn value_at<'a>(values: &'a [Value], path: &[usize]) -> Option<&'a Value> {
     let value = values.get(*path.first()?)?;
     if path.len() == 1 {
@@ -1356,6 +1464,59 @@ fn put(data: &mut SchemaData, path: &[usize], value: Value) {
     }
 }
 
+/// Does any range in this schema name a count?
+///
+/// Worth asking once per pass: when the answer is no -- every schema written
+/// before this feature -- candidate checking is skipped entirely and reduction
+/// follows exactly the path it always did.
+fn any_dynamic_bounds(items: &[Decl]) -> bool {
+    items.iter().any(|d| match d {
+        Decl::Repeat { body, .. } => any_dynamic_bounds(body),
+        other => decl_bounds(other).is_dynamic(),
+    })
+}
+
+/// Is every dynamically bounded value still inside its range?
+///
+/// This is the entire mechanism, and it is deliberately not a cascade. A
+/// numeric bound says nothing about *which* positions survive, so it induces no
+/// mask and takes no part in propagation; it only decides whether an
+/// already-chosen candidate is legal. Deleting array elements can pull `N`
+/// below a magnitude that `in 1..N` still has to admit, and the correct answer
+/// is that this candidate is not reachable *yet*: the value pass shrinks the
+/// offending magnitudes first, and the next structural round -- the schedule
+/// already alternates -- offers the same deletion again.
+///
+/// Clamping instead was rejected. Renumbering a reference during projection
+/// preserves identity: the same element, a new label. Clamping a magnitude
+/// from 7 to 3 preserves nothing, and would be a value edit smuggled into a
+/// structural pass without the oracle ever approving it as one.
+fn dynamic_bounds_hold(data: &SchemaData) -> bool {
+    for path in data.all_sites() {
+        let Some(decl) = decl_at(&data.schema.items, &path) else {
+            continue;
+        };
+        let bounds = decl_bounds(decl);
+        if !bounds.is_dynamic() {
+            continue;
+        }
+        let Some(block) = block_values_at(&data.values, &path[..path.len() - 1]) else {
+            return false;
+        };
+        let limits = bounds.resolve(block);
+        let ok = match value_at(&data.values, &path) {
+            Some(Value::Int(v)) => limits.contains(*v),
+            Some(Value::Array(a)) => a.iter().all(|v| limits.contains(*v)),
+            Some(Value::Matrix(m)) => m.iter().flatten().all(|v| limits.contains(*v)),
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 impl SchemaData {
     fn all_sites(&self) -> Vec<Path> {
         let mut out = Vec::new();
@@ -1379,6 +1540,9 @@ impl SchemaData {
     /// and whole repeat iterations. Declared counts are recomputed after each
     /// accepted edit, and no count is taken below its declared minimum.
     pub fn structural_pass(&self, accept: &mut dyn FnMut(&SchemaData) -> bool) -> SchemaData {
+        let dynamic = any_dynamic_bounds(&self.schema.items);
+        let accept: &mut dyn FnMut(&SchemaData) -> bool =
+            &mut |c: &SchemaData| (!dynamic || dynamic_bounds_hold(c)) && accept(c);
         let mut data = self.clone();
         // Every accepted edit strictly shrinks the input, so this terminates;
         // the counter only bounds pathological schemas.
@@ -1401,6 +1565,9 @@ impl SchemaData {
     /// Pull integers toward the legal value nearest zero. Derived counts are
     /// skipped: they follow the data, they do not lead it.
     pub fn value_pass(&self, accept: &mut dyn FnMut(&SchemaData) -> bool) -> SchemaData {
+        let dynamic = any_dynamic_bounds(&self.schema.items);
+        let accept: &mut dyn FnMut(&SchemaData) -> bool =
+            &mut |c: &SchemaData| (!dynamic || dynamic_bounds_hold(c)) && accept(c);
         let mut data = self.clone();
         let schema = Rc::clone(&data.schema);
         for path in data.all_sites() {
@@ -1410,12 +1577,18 @@ impl SchemaData {
             let Some(value) = value_at(&data.values, &path).cloned() else {
                 continue;
             };
+            // Where value shrinking aims, with any named side of the range
+            // read from this site's own block instantiation.
+            let limits = match block_values_at(&data.values, &path[..path.len() - 1]) {
+                Some(block) => decl_bounds(decl).resolve(block),
+                None => Limits::default(),
+            };
             match (decl, value) {
-                (Decl::Int { name, bounds }, Value::Int(v)) => {
+                (Decl::Int { name, .. }, Value::Int(v)) => {
                     if schema.is_derived(name) {
                         continue;
                     }
-                    let reduced = shrink_value_toward(v, bounds.target(), |cand| {
+                    let reduced = shrink_value_toward(v, limits.target(), |cand| {
                         let mut trial = data.clone();
                         put(&mut trial, &path, Value::Int(cand));
                         accept(&trial)
@@ -1424,8 +1597,8 @@ impl SchemaData {
                         put(&mut data, &path, Value::Int(reduced));
                     }
                 }
-                (Decl::Array { bounds, .. }, Value::Array(arr)) => {
-                    let reduced = shrink_ints_toward(&arr, bounds.target(), |cand| {
+                (Decl::Array { .. }, Value::Array(arr)) => {
+                    let reduced = shrink_ints_toward(&arr, limits.target(), |cand| {
                         let mut trial = data.clone();
                         put(&mut trial, &path, Value::Array(cand.to_vec()));
                         accept(&trial)
@@ -1434,11 +1607,11 @@ impl SchemaData {
                         put(&mut data, &path, Value::Array(reduced));
                     }
                 }
-                (Decl::Matrix { bounds, .. }, Value::Matrix(grid)) => {
+                (Decl::Matrix { .. }, Value::Matrix(grid)) => {
                     let mut next = grid.clone();
                     for r in 0..next.len() {
                         let row = next[r].clone();
-                        let reduced = shrink_ints_toward(&row, bounds.target(), |cand| {
+                        let reduced = shrink_ints_toward(&row, limits.target(), |cand| {
                             let mut trial_grid = next.clone();
                             trial_grid[r] = cand.to_vec();
                             let mut trial = data.clone();
@@ -2116,7 +2289,10 @@ fn shrink_occurrence(
     accept: &mut dyn FnMut(&SchemaData) -> bool,
 ) -> bool {
     let schema = Rc::clone(&data.schema);
-    let bounds = schema.axis_bounds(occ.axis);
+    let bounds = match block_values_at(&data.values, &occ.prefix) {
+        Some(block) => schema.axis_bounds(occ.axis).resolve(block),
+        None => Limits::default(),
+    };
     // The solver addresses targets by (prefix, axis), so it needs the whole
     // set; induction still only ever reaches the same block instantiation.
     let all: Vec<Occurrence> = data.all_occurrences();
@@ -2297,6 +2473,291 @@ mod tests {
             }
         }
         current
+    }
+
+    /// The schedule alternates structural and value reduction and retries both
+    /// until a fixed point, so a structural step that is *currently* infeasible
+    /// is not lost -- the next round sees it again once values have shrunk.
+    /// Dynamic bounds are about to depend on exactly this, so it is pinned
+    /// here, with static bounds, before that feature exists.
+    #[test]
+    fn structural_shrinking_is_retried_after_the_value_pass() {
+        let text = "int N in 1..10
+array A[N] in 0..999
+";
+        let data = build(
+            text,
+            "5
+7 7 7 7 7
+",
+        );
+
+        // Dropping an element is allowed only once every value is at most 1.
+        // Round 1 therefore cannot shrink `N` at all; the value pass then makes
+        // it feasible and round 2 takes it down.
+        let out = reduce(&data, |rendered| {
+            let v = ints(rendered);
+            let (n, rest) = v.split_first().expect("a count");
+            *n as usize == rest.len() && (rest.iter().all(|x| *x <= 1) || rest.len() >= 5)
+        });
+        assert_eq!(ints(&out.render()), vec![1, 0]);
+    }
+
+    // ---- dynamic numeric bounds -----------------------------------------
+
+    /// 1. `array A[N] in 1..N` parses and round-trips unchanged.
+    #[test]
+    fn a_count_bounded_array_round_trips() {
+        let text = "int N in 1..10\narray A[N] in 1..N\n";
+        let input = "3\n1 3 2\n";
+        let data = build(text, input);
+        assert_eq!(data.render(), input);
+        assert_eq!(parse_input(&data.schema, &data.render()).unwrap(), data);
+
+        // Out of range for the *current* N, so reading refuses it.
+        let err = parse_input(&data.schema, "3\n1 4 2\n").unwrap_err();
+        assert!(err.contains("outside the declared range 1..3"), "{err}");
+    }
+
+    /// 2. It is an ordinary integer array. Duplicates are legal, and it gains
+    ///    none of the identity machinery: there is no codomain to reference.
+    #[test]
+    fn a_count_bounded_array_is_not_a_permutation() {
+        let text = "int N in 1..10\narray A[N] in 1..N\n";
+        let data = build(text, "3\n2 2 2\n");
+        assert_eq!(ints(&data.render()), vec![3, 2, 2, 2]);
+
+        // No second axis exists, so nothing can follow A's values.
+        let err = parse_schema("int N in 1..10\narray A[N] in 1..N\narray W[A.values]\n")
+            .expect_err("A is not a permutation");
+        assert!(err.contains('A'), "{err}");
+    }
+
+    /// 3. Every candidate the oracle is offered satisfies its own dynamic
+    ///    bound. Structural deletion can pull `N` under a surviving magnitude,
+    ///    and when it does the candidate is withheld rather than repaired.
+    #[test]
+    fn structural_candidates_never_break_a_dynamic_bound() {
+        let text = "int N in 1..10\narray A[N] in 1..N\n";
+        let data = build(text, "5\n1 2 3 4 5\n");
+
+        let mut seen = 0usize;
+        let out = data.structural_pass(&mut |candidate| {
+            seen += 1;
+            let v = ints(&candidate.render());
+            let (n, rest) = v.split_first().expect("a count");
+            assert!(
+                rest.iter().all(|x| *x >= 1 && *x <= *n),
+                "candidate {v:?} violates 1..{n}"
+            );
+            true
+        });
+        assert!(seen > 0, "the pass must actually offer candidates");
+        let v = ints(&out.render());
+        let (n, rest) = v.split_first().expect("a count");
+        assert!(rest.iter().all(|x| *x >= 1 && *x <= *n));
+    }
+
+    /// 4. The point of choosing rejection over clamping: a deletion that is
+    ///    infeasible now becomes feasible after the value pass, and the
+    ///    schedule retries it. Round 1 cannot shrink `N` at all here.
+    #[test]
+    fn n_shrinks_only_after_values_do() {
+        let text = "int N in 1..10\narray A[N] in 1..N\n";
+        let data = build(text, "5\n5 5 5 5 5\n");
+
+        // One round on its own gets stuck: every deletion leaves a 5 behind.
+        let mut accept = |_: &SchemaData| true;
+        let one_round = data.structural_pass(&mut accept);
+        assert_eq!(
+            ints(&one_round.render()),
+            vec![5, 5, 5, 5, 5, 5],
+            "structure alone cannot move"
+        );
+
+        // The full schedule alternates, so values drop to 1 and the next
+        // structural round takes N all the way down.
+        let out = reduce(&data, |_| true);
+        assert_eq!(ints(&out.render()), vec![1, 1]);
+    }
+
+    /// 5. The scalar case falls out of the same resolution.
+    #[test]
+    fn a_scalar_may_be_bounded_by_a_count() {
+        let text = "int N in 1..10\narray A[N] in 0..999\nint X in 1..N\n";
+        let data = build(text, "3\n7 8 9\n3\n");
+        assert_eq!(parse_input(&data.schema, &data.render()).unwrap(), data);
+
+        let err = parse_input(&data.schema, "3\n7 8 9\n4\n").unwrap_err();
+        assert!(err.contains("outside the declared range 1..3"), "{err}");
+
+        // X is an ordinary magnitude, so it shrinks toward its resolved floor.
+        let out = reduce(&data, |_| true);
+        assert_eq!(ints(&out.render()), vec![1, 0, 1]);
+    }
+
+    /// 6. Inside a `repeat`, a bound resolves against its own instance. The
+    ///    input below is legal for instance 0 and illegal for instance 1, so a
+    ///    resolver that leaked the first `N` would wrongly accept it.
+    #[test]
+    fn a_dynamic_bound_resolves_within_its_own_instance() {
+        let text = "int T in 1..3\nrepeat T {\n  int N in 1..10\n  array A[N] in 1..N\n}\n";
+        let data = build(text, "2\n3\n3 1 1\n2\n1 2\n");
+        assert_eq!(parse_input(&data.schema, &data.render()).unwrap(), data);
+
+        // 3 is fine under instance 0's N=3 and impossible under instance 1's
+        // N=2. Reading must judge each iteration on its own count.
+        let err = parse_input(&data.schema, "2\n3\n3 1 1\n2\n3 1\n").unwrap_err();
+        assert!(err.contains("outside the declared range 1..2"), "{err}");
+    }
+
+    /// 6b. The reduce-side twin of the test above. Reading resolves against
+    ///     the block it is building; projection resolves through
+    ///     `block_values_at`, which is a separate path -- and at first only the
+    ///     benchcase caught an injected fault in it.
+    #[test]
+    fn a_projected_candidate_resolves_its_own_instance() {
+        let text = "int T in 1..3
+repeat T {
+  int N in 1..10
+  array A[N] in 1..N
+}
+";
+        let data = build(
+            text,
+            "2
+5
+1 1 1 1 1
+2
+2 2
+",
+        );
+
+        let axis = data
+            .schema
+            .sizing_axis(&Ref::Name("N".into()))
+            .expect("N has an axis");
+        let all = data.all_occurrences();
+        let instances: Vec<Occurrence> = all.iter().filter(|o| o.axis == axis).cloned().collect();
+        assert_eq!(instances.len(), 2, "one occurrence per iteration");
+
+        // Instance 1 keeps one of its two positions, leaving the value 2 under
+        // a new N of 1. Instance 0's N is still 5, so a resolver reading the
+        // wrong block would wave this candidate through.
+        let kept = project_occurrence(&data, &instances[1], &[0], &all).expect("projects");
+        assert_eq!(ints(&kept.render()), vec![2, 5, 1, 1, 1, 1, 1, 1, 2]);
+        assert!(!dynamic_bounds_hold(&kept), "2 is out of range for N = 1");
+    }
+
+    /// 7. A range may only name an `int` declared earlier in the same block.
+    #[test]
+    fn an_unknown_or_forward_bound_name_is_rejected() {
+        let unknown =
+            parse_schema("int N in 1..10\narray A[N] in 1..M\n").expect_err("M does not exist");
+        assert!(unknown.contains("no `int` named `M`"), "{unknown}");
+
+        let forward =
+            parse_schema("array A[3] in 1..M\nint M in 1..10\n").expect_err("M is declared later");
+        assert!(forward.contains("no `int` named `M`"), "{forward}");
+
+        let other_block =
+            parse_schema("int T in 1..3\nrepeat T {\n  int N in 1..10\n}\narray A[3] in 1..N\n")
+                .expect_err("N lives in the repeat body");
+        assert!(other_block.contains("no `int` named `N`"), "{other_block}");
+    }
+
+    /// 8. Only an `int` can bound a range, and the error says so directly
+    ///    rather than reporting the name as missing.
+    #[test]
+    fn a_non_integer_declaration_cannot_bound_a_range() {
+        let err = parse_schema("int N in 1..10\narray B[N] in 0..9\narray A[3] in 1..B\n")
+            .expect_err("B is an array");
+        assert!(err.contains("`B` is not an `int`"), "{err}");
+    }
+
+    /// 9. A literal range resolves to itself, whatever the data says, so every
+    ///    schema written before this feature behaves exactly as it did.
+    #[test]
+    fn literal_bounds_are_unaffected_by_resolution() {
+        let literal = Bounds {
+            lo: Some(Bound::Lit(2)),
+            hi: Some(Bound::Lit(7)),
+        };
+        assert!(!literal.is_dynamic());
+        assert_eq!(
+            literal.resolve(&[Value::Int(99)]),
+            Limits {
+                lo: Some(2),
+                hi: Some(7)
+            }
+        );
+        assert_eq!(literal.resolve(&[]), literal.resolve(&[Value::Int(1)]));
+
+        let text = "int N in 1..10\narray A[N] in 1..5\n";
+        assert!(!any_dynamic_bounds(&parse_schema(text).unwrap().items));
+    }
+
+    /// 10. `index I[K] into N` and `int X in 1..N` both mention `N` and mean
+    ///     entirely different things. Narrowing `N` renumbers the reference,
+    ///     because it names an element; the magnitude is left alone.
+    #[test]
+    fn a_reference_renumbers_where_a_magnitude_does_not() {
+        let text = "int N in 1..10\narray A[N] in 0..999\nint K in 0..10\n\
+                    index I[K] into N\nint X in 1..N\n";
+        let data = build(text, "4\n10 20 30 40\n2\n3 4\n2\n");
+
+        let (occ, all) = occurrence_for(&data, "N");
+        // Keep the last three positions: I's references 3 and 4 become 2 and 3.
+        let kept = project_occurrence(&data, &occ, &[1, 2, 3], &all).expect("projects");
+        assert_eq!(ints(&kept.render()), vec![3, 20, 30, 40, 2, 2, 3, 2]);
+        // X was 2 before and is 2 after: a magnitude, not a position.
+        assert_eq!(*ints(&kept.render()).last().unwrap(), 2);
+    }
+
+    /// 11. A permutation beside a dynamic bound keeps identity semantics, and
+    ///     the bound does not disturb its cascade.
+    #[test]
+    fn a_permutation_is_unaffected_by_a_neighbouring_dynamic_bound() {
+        let text = "int N in 1..10\npermutation P[N]\narray A[N] in 1..N\n";
+        let data = build(text, "4\n3 1 4 2\n4 4 4 4\n");
+
+        let (occ, all) = occurrence_for(&data, "N");
+        let kept = project_occurrence(&data, &occ, &[0, 2], &all).expect("projects");
+        // P keeps its identity: labels 3 and 4 renumber to 1 and 2. A's values
+        // are magnitudes and stay 4 -- which is now out of range, so the
+        // candidate exists but the guard withholds it.
+        assert_eq!(ints(&kept.render()), vec![2, 1, 2, 4, 4]);
+        assert!(!dynamic_bounds_hold(&kept));
+    }
+
+    /// 12. Three identity producers and a numeric bound in one schema. The
+    ///     bound must contribute nothing to propagation, so the masks are
+    ///     identical to the same schema without it.
+    #[test]
+    fn a_dynamic_bound_adds_no_mask_propagation() {
+        let with = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                    index I[M] into N\npermutation P[N]\narray W[N] in 1..N\n";
+        let without = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                       index I[M] into N\npermutation P[N]\n";
+        let input = "4 2\n1 2\n3 4\n1 3\n2 1 4 3\n";
+
+        let a = build(with, &format!("{input}1 2 3 4\n"));
+        let b = build(without, input);
+
+        let (occ_a, all_a) = occurrence_for(&a, "N");
+        let (occ_b, all_b) = occurrence_for(&b, "N");
+        let state_a = propagate(&a, &occ_a, &[0, 1, 2], &all_a);
+        let state_b = propagate(&b, &occ_b, &[0, 1, 2], &all_b);
+
+        // Same axes, same masks, same number of worklist updates.
+        let masks = |s: &Propagation| -> Vec<(usize, Vec<usize>)> {
+            s.masks
+                .iter()
+                .map(|((_, ax), m)| (*ax, m.clone()))
+                .collect()
+        };
+        assert_eq!(masks(&state_a), masks(&state_b));
+        assert_eq!(state_a.updates, state_b.updates);
     }
 
     fn ints(text: &str) -> Vec<i64> {
