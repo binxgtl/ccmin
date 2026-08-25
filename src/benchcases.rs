@@ -445,6 +445,25 @@ repeat T {
         Pred::ContainsAll(&[30, 40]),
     );
 
+    // A literal edge count cannot absorb a lost edge, so any vertex selection
+    // that kills one must be rejected. Without that rule the reducer happily
+    // emits a graph with fewer edges than the format declares.
+    add(
+        "graph_literal_edge_count",
+        Some(
+            "int N in 2..10
+graph E[2] vertices N
+",
+        ),
+        Shape::Auto,
+        "4
+1 2
+3 4
+"
+        .into(),
+        Pred::Always,
+    );
+
     // --- the unstructured fallback --------------------------------------
     add(
         "raw_tokens",
@@ -692,6 +711,7 @@ fn corpus_covers_every_reduction_path() {
         "index_cascade",
         "graph_and_index_same_target",
         "index_nested_instances",
+        "graph_literal_edge_count",
         "raw_tokens",
     ] {
         assert!(names.contains(&required), "corpus lost `{required}`");

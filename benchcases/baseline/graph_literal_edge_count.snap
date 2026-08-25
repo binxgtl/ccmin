@@ -1,0 +1,11 @@
+# ccmin baseline snapshot for `graph_literal_edge_count`
+# Exact counts, not thresholds. Regenerate with:
+#   UPDATE_BENCH=1 cargo test --release benchcases
+initial_tokens = 5
+final_tokens = 5
+oracle_calls = 0
+predicate_holds = true
+[input]
+4
+1 2
+3 4

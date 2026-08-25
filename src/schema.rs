@@ -1518,6 +1518,111 @@ impl Propagation {
 /// Projecting between events would let a later inducer read data whose
 /// positional identity had already been destroyed, so every inducer derives
 /// from the original data plus the current source mask.
+/// A selection one relation induces on another axis of the same block.
+struct Induced {
+    axis: AxisId,
+    keep: Vec<usize>,
+}
+
+/// Everything the relations induce when `occ` narrows to `source`.
+///
+/// The two rules have the same shape -- observe an occurrence's mask, name a
+/// sibling axis, return positional survivors -- and the emit path after them
+/// (find the target, take its domain, narrow, enqueue) was duplicated verbatim.
+/// That shared shape is the whole abstraction; it is a function returning a
+/// list, not a trait, because the rule set is closed and known at the only call
+/// site, so dispatch would buy indirection and nothing else.
+///
+/// Order is graph rules then index rules, matching what the open-coded loops
+/// did. The fixed point does not depend on it -- intersection commutes -- but
+/// keeping it makes the search path reproducible.
+fn induced_selections(
+    schema: &Schema,
+    data: &SchemaData,
+    occ: &Occurrence,
+    source: &[usize],
+) -> Vec<Induced> {
+    let mut out = Vec::new();
+    induce_from_graph_vertices(schema, data, occ, source, &mut out);
+    induce_from_index_targets(schema, data, &occ.prefix, occ.axis, source, &mut out);
+    out
+}
+
+/// Keeping a set of vertices determines which edge positions can survive.
+///
+/// Derived from the ORIGINAL edge list, never from a projection.
+fn induce_from_graph_vertices(
+    schema: &Schema,
+    data: &SchemaData,
+    occ: &Occurrence,
+    source: &[usize],
+    out: &mut Vec<Induced>,
+) {
+    for member in &occ.members {
+        if member.role != Role::GraphVertices {
+            continue;
+        }
+        let path = occ.path_of(member);
+        let (Some(Value::Graph(graph)), Some(Decl::Graph { edges, .. })) =
+            (value_at(&data.values, &path), decl_at(&schema.items, &path))
+        else {
+            continue;
+        };
+        let Some(axis) = schema.sizing_axis(edges) else {
+            continue;
+        };
+        out.push(Induced {
+            axis,
+            keep: induced_edge_keep(graph, source),
+        });
+    }
+}
+
+/// An `index` into this axis loses every reference to a position that is gone.
+///
+/// Reads the ORIGINAL references: their values are positions in the target's
+/// original domain, which a projection no longer carries.
+fn induce_from_index_targets(
+    schema: &Schema,
+    data: &SchemaData,
+    prefix: &Path,
+    axis: AxisId,
+    source: &[usize],
+    out: &mut Vec<Induced>,
+) {
+    let Some(block) = block_at(&schema.items, prefix) else {
+        return;
+    };
+    for (i, decl) in block.iter().enumerate() {
+        let Decl::Index { len, target, .. } = decl else {
+            continue;
+        };
+        if schema.sizing_axis(target) != Some(axis) {
+            continue;
+        }
+        let Some(index_axis) = schema.sizing_axis(len) else {
+            continue;
+        };
+        let mut path = prefix.clone();
+        path.push(i);
+        let Some(Value::Array(refs)) = value_at(&data.values, &path) else {
+            continue;
+        };
+        out.push(Induced {
+            axis: index_axis,
+            keep: refs
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| match usize::try_from(**v - 1) {
+                    Ok(position) => source.binary_search(&position).is_ok(),
+                    Err(_) => false,
+                })
+                .map(|(position, _)| position)
+                .collect(),
+        });
+    }
+}
+
 fn propagate(
     data: &SchemaData,
     seed: &Occurrence,
@@ -1544,84 +1649,18 @@ fn propagate(
             continue;
         };
 
-        for member in &occ.members {
-            // The one induction rule that exists: keeping a set of vertices
-            // determines which edge positions can survive.
-            if member.role != Role::GraphVertices {
-                continue;
-            }
-            let path = occ.path_of(member);
-            let (Some(Value::Graph(graph)), Some(Decl::Graph { edges, .. })) =
-                (value_at(&data.values, &path), decl_at(&schema.items, &path))
-            else {
-                continue;
-            };
-            let Some(edge_axis) = schema.sizing_axis(edges) else {
-                continue;
-            };
-            // Derived from the ORIGINAL edge list, never from a projection.
-            let induced = induced_edge_keep(graph, &source);
-
-            let target: OccurrenceKey = (occ.prefix.clone(), edge_axis);
-            let Some(target_occ) = all.iter().find(|o| (o.prefix.clone(), o.axis) == target) else {
+        // One emit path for every relation form.
+        for Induced { axis, keep } in induced_selections(&schema, data, occ, &source) {
+            let target: OccurrenceKey = (key.0.clone(), axis);
+            let Some(target_occ) = all.iter().find(|o| o.prefix == key.0 && o.axis == axis) else {
                 continue;
             };
             let Some(extent) = occurrence_extent(data, target_occ) else {
                 continue;
             };
             let domain: Vec<usize> = (0..extent).collect();
-            if state.narrow(target.clone(), &induced, &domain) {
+            if state.narrow(target.clone(), &keep, &domain) {
                 queue.push_back(target);
-            }
-        }
-
-        // Producer #2. An `index` whose target axis just narrowed loses every
-        // reference to a position that no longer survives. Same event, same
-        // merge, same queue -- a second producer, not a second mechanism.
-        let Some(block) = block_at(&schema.items, &key.0) else {
-            continue;
-        };
-        for (i, decl) in block.iter().enumerate() {
-            let Decl::Index { len, target, .. } = decl else {
-                continue;
-            };
-            if schema.sizing_axis(target) != Some(key.1) {
-                continue;
-            }
-            let Some(index_axis) = schema.sizing_axis(len) else {
-                continue;
-            };
-            let mut path = key.0.clone();
-            path.push(i);
-            // ORIGINAL references plus the current source mask. Never a
-            // projection: the values are positions in the target's original
-            // domain, and projected data no longer carries that identity.
-            let Some(Value::Array(refs)) = value_at(&data.values, &path) else {
-                continue;
-            };
-            let survivors: Vec<usize> = refs
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| match usize::try_from(**v - 1) {
-                    Ok(position) => source.binary_search(&position).is_ok(),
-                    Err(_) => false,
-                })
-                .map(|(position, _)| position)
-                .collect();
-
-            let target_key: OccurrenceKey = (key.0.clone(), index_axis);
-            let Some(target_occ) = all
-                .iter()
-                .find(|o| o.prefix == key.0 && o.axis == index_axis)
-            else {
-                continue;
-            };
-            let Some(extent) = occurrence_extent(data, target_occ) else {
-                continue;
-            };
-            let domain: Vec<usize> = (0..extent).collect();
-            if state.narrow(target_key.clone(), &survivors, &domain) {
-                queue.push_back(target_key);
             }
         }
     }
@@ -1693,7 +1732,7 @@ fn project_graph(
     g: &GraphCase,
     vertex_keep: Option<&[usize]>,
     edge_keep: Option<&[usize]>,
-) -> GraphCase {
+) -> Option<GraphCase> {
     let kept: Vec<usize> = match vertex_keep {
         Some(v) => v.to_vec(),
         None => (0..g.n).collect(),
@@ -1704,23 +1743,32 @@ fn project_graph(
             remap[position + 1] = new + 1;
         }
     }
-    let edges = g
-        .edges
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| match edge_keep {
-            Some(keep) => keep.binary_search(i).is_ok(),
+
+    let mut edges = Vec::new();
+    for (i, e) in g.edges.iter().enumerate() {
+        let selected = match edge_keep {
+            Some(keep) => keep.binary_search(&i).is_ok(),
             None => true,
-        })
-        .filter_map(|(_, e)| {
-            let (u, v) = (remap[e.u], remap[e.v]);
-            (u != 0 && v != 0).then_some(Edge { u, v })
-        })
-        .collect();
-    GraphCase {
+        };
+        if !selected {
+            continue;
+        }
+        let (u, v) = (remap[e.u], remap[e.v]);
+        // The shared validate rule: a surviving reference must name a
+        // surviving position. Reaching here means the induction kept an edge
+        // whose endpoint is gone, so reject the candidate rather than drop the
+        // edge silently -- dropping it would leave the edge count describing
+        // data that is no longer there. Same discipline as `renumber_indices`.
+        if u == 0 || v == 0 {
+            return None;
+        }
+        edges.push(Edge { u, v });
+    }
+
+    Some(GraphCase {
         n: kept.len(),
         edges,
-    }
+    })
 }
 
 /// Apply every mask that reached one value, in one step.
@@ -1735,7 +1783,7 @@ fn apply_masks(value: &Value, ops: &[(Role, Vec<usize>)]) -> Option<Value> {
             g,
             find(Role::GraphVertices),
             find(Role::Edges),
-        )),
+        )?),
         Value::Matrix(grid) => {
             let mut out = grid.clone();
             if let Some(rows) = find(Role::Rows) {
@@ -3148,6 +3196,83 @@ repeat T {
         for r in refs {
             assert!(*r >= 1 && r <= n, "reference {r} outside 1..={n}");
         }
+    }
+
+    /// Both relation forms flow through one seam, in a defined order, and each
+    /// contributes its own positional survivors before anything is merged.
+    #[test]
+    fn both_relation_forms_come_out_of_one_induce_seam() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n\
+                    index I[M] into N\n";
+        let data = build(text, "4 3\n1 2\n2 3\n3 4\n4 3 1\n");
+        let (occ, _) = occurrence_for(&data, "N");
+        let m_axis = data.schema.sizing_axis(&Ref::Name("M".into())).unwrap();
+
+        // Keeping vertices 1, 2, 3.
+        let induced = induced_selections(&data.schema, &data, &occ, &[0, 1, 2]);
+        assert_eq!(induced.len(), 2, "one from each form");
+        // Graph first, then index -- the order the open-coded loops used.
+        assert_eq!(induced[0].axis, m_axis);
+        assert_eq!(
+            induced[0].keep,
+            vec![0, 1],
+            "edges with both endpoints alive"
+        );
+        assert_eq!(induced[1].axis, m_axis);
+        assert_eq!(induced[1].keep, vec![1, 2], "references to live vertices");
+
+        // Neither rule merges; that is the emit path's job, and it intersects.
+        let state = propagate(&data, &occ, &[0, 1, 2], &data.all_occurrences());
+        assert_eq!(state.masks.get(&(Vec::new(), m_axis)), Some(&vec![1usize]));
+    }
+
+    /// The shared validate rule, on the graph side: a kept edge whose endpoint
+    /// is gone rejects the candidate instead of being dropped.
+    ///
+    /// Dropping it would leave the edge count describing data that is no longer
+    /// there -- and if that count is shared, the co-sized members would keep
+    /// the longer mask. Same discipline as a dangling index reference.
+    #[test]
+    fn a_kept_edge_with_a_dead_endpoint_rejects_the_candidate() {
+        let text = "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\n";
+        let data = build(text, "3 2\n1 2\n2 3\n");
+        let all = data.all_occurrences();
+        let n_axis = data.schema.sizing_axis(&Ref::Name("N".into())).unwrap();
+        let m_axis = data.schema.sizing_axis(&Ref::Name("M".into())).unwrap();
+
+        // Hand-built and deliberately inconsistent: only vertex 1 survives, yet
+        // edge 0 -- which needs vertex 2 -- is still kept.
+        let mut state = Propagation {
+            masks: BTreeMap::new(),
+            updates: 0,
+        };
+        state.masks.insert((Vec::new(), n_axis), vec![0]);
+        state.masks.insert((Vec::new(), m_axis), vec![0]);
+
+        assert!(
+            project_fixpoint(&data, &state, &all).is_none(),
+            "a dangling endpoint must reject, not silently drop the edge"
+        );
+    }
+
+    /// The latent case the validate rule also fixes. With a literal edge count
+    /// there is no edge axis, so nothing can carry an induced selection, and a
+    /// vertex selection that kills an edge would previously have emitted a
+    /// graph with fewer edges than the format declares.
+    #[test]
+    fn a_vertex_selection_that_breaks_a_literal_edge_count_rejects() {
+        let text = "int N in 2..10\ngraph E[2] vertices N\n";
+        let data = build(text, "3\n1 2\n2 3\n");
+        let (occ, all) = occurrence_for(&data, "N");
+
+        // Dropping vertex 3 kills edge (2,3), but the count is fixed at 2.
+        assert!(
+            project_occurrence(&data, &occ, &[0, 1], &all).is_none(),
+            "the edge count cannot absorb the loss, so the candidate is invalid"
+        );
+        // Keeping every vertex leaves both edges intact, so it still projects.
+        let whole = project_occurrence(&data, &occ, &[0, 1, 2], &all).expect("projects");
+        assert_eq!(ints(&whole.render()), vec![3, 1, 2, 2, 3]);
     }
 
     #[test]

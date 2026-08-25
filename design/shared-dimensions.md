@@ -1,7 +1,7 @@
 # Shared dimensions — design note for v0.5
 
-Status: revision 7. Implementation under way; the vertex-to-edge cascade of
-§5 is built.
+Status: revision 8. Implementation under way; the cascade engine, both
+relation forms and the shared seams between them are built.
 
 Revision 2 separated Count from Axis. Revision 3 resolved permutations,
 count-shrink propagation and where independence lives. Revision 4 fixed two
@@ -10,7 +10,9 @@ fixpoint over cardinality events. Revision 6 separates the static arena from
 runtime state, after checkpoint 3 of the implementation ran into it. What each
 revision got wrong is kept in §13 to §18 rather than folded in silently.
 Revision 7 separates an induced *selection* from a cardinality *requirement*,
-after the first real cascade made the difference concrete.
+after the first real cascade made the difference concrete. Revision 8
+records the abstraction that two relation forms actually justified, and the
+four larger ones they did not.
 
 Four sentences the implementation has to keep true throughout:
 
@@ -281,21 +283,65 @@ which of its entries point at something that vanished. Until a relation turns
 up whose information really is "this many" rather than "these ones",
 `RequireCardinality` would be a type with no inhabitants.
 
-For a bijection the edge is bidirectional (§9). The engine contract:
+For a bijection the edge is bidirectional (see the permutations section).
+
+### What two relation forms justified
+
+Earlier revisions sketched a contract of `Relation::induce` and
+`Relation::validate`. With two forms built -- graph vertices inducing edges, and
+`index` references -- the genuinely common part turned out smaller than that,
+and is what got extracted:
 
 ```text
-Relation::induce(changed_axis, state) -> [(AxisId, KeepMask)]
-Relation::validate(state)             -> bool
+induced_selections(schema, data, occurrence, source_mask) -> [Induced { axis, keep }]
 ```
 
-with two obligations on every relation:
+Both forms have one shape: observe a narrowed occurrence's mask, name a sibling
+axis in the same block, return positional survivors. What was duplicated
+verbatim was not the rules but the *emit path* after them -- find the target
+occurrence, take its domain, `narrow`, enqueue -- so that is what collapsed to
+one copy. The rules stayed two plain functions.
 
-1. `induced_mask ⊆ current_mask` — a relation may only remove positions;
-2. induction is monotone — the same state never yields a larger mask later.
+The obligations are unchanged, and are still what makes the lattice argument
+hold:
 
-Given those, §5's finite-descending-lattice argument covers relations with no
-change. Writing the contract this way is also what lets a second relation be
-added without touching the cascade.
+1. `induced_mask` is a subset of `current_mask` -- a relation only removes;
+2. induction is monotone -- the same state never yields a larger mask later.
+
+The second common thing is a *validation* rule, not an induction one:
+
+> **A surviving reference must name a surviving position.**
+
+Both forms can violate it and both now reject rather than repair. `index`
+already did. A graph endpoint used to be dropped silently, which is wrong for a
+reason only visible once counts are shared: dropping an edge leaves the edge
+count describing data that is no longer there, and a co-sized member would keep
+the longer mask. Making it symmetric also fixed a latent case with no sharing at
+all -- `graph E[2] vertices N`, where a literal count cannot absorb a lost edge,
+and the reducer previously emitted a graph with fewer edges than the format
+declares.
+
+### Rejected, with reasons
+
+- **A `Relation` trait with dynamic dispatch.** The rule set is closed and known
+  at a single call site. Dispatch would buy indirection and nothing else, and
+  makes two rules harder to read than two named functions do.
+- **A `Relation` enum with `induce` and `validate` methods.** The forms are
+  *discovered* differently: the graph rule from a member's role on the narrowed
+  occurrence, the index rule by scanning the block for declarations pointing at
+  it. A uniform relation value would have to be materialised first, which is
+  more machinery than the thing it abstracts.
+- **Unifying projection.** Graph relabelling and index renumbering are the same
+  idea -- rewrite survivors, drop holders of the dead -- but the graph does both
+  inside one `Value::Graph`, which bundles the vertex count with the edge list.
+  Sharing the mechanism would mean splitting that value: a larger, less local
+  change than the duplication costs.
+- **A single post-fixpoint `validate_references` pass.** Tempting for symmetry,
+  but the graph's check belongs inside the relabelling it already does, and a
+  pass existing to hold one extra call site is not an abstraction.
+
+The test of whether this is the right size: a third relation form should need a
+rule function and one line in `induced_selections`, and nothing else.
 
 ---
 
@@ -693,8 +739,9 @@ property of an array; it is which axis the array points at (§6).
    Producer #2 on the existing worklist; no redesign.
 6. RequireCardinality, once a relation induces only a size.
    Still no producer: both cascades are positional.
-7. Generalise validate / induce once two relation forms
-   exist to prove the abstraction.
+7. Generalise validate / induce once two relation forms      done
+   exist to prove the abstraction. One induce seam, one
+   emit path, one shared validation rule.
 ```
 
 The order changed at step 3. Earlier revisions put `Index` before the cascade;
