@@ -3,7 +3,7 @@
 Notable changes per release. Earlier releases (0.1.0 – 0.4.0) predate this file;
 see the git tags and the GitHub releases page for those.
 
-## Unreleased
+## 0.5.1
 
 ### Correctness fixes
 
