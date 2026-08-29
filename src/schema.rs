@@ -1464,19 +1464,24 @@ fn put(data: &mut SchemaData, path: &[usize], value: Value) {
     }
 }
 
-/// Does any range in this schema name a count?
+/// Does anything here need re-checking after an edit?
 ///
-/// Worth asking once per pass: when the answer is no -- every schema written
-/// before this feature -- candidate checking is skipped entirely and reduction
-/// follows exactly the path it always did.
-fn any_dynamic_bounds(items: &[Decl]) -> bool {
+/// A literal range on a *value* cannot be invalidated by deletion, since
+/// deletion never rewrites a value. Two kinds can: a range that names a count,
+/// and a derived count with a declared range of its own, because that one is
+/// recomputed from the data. Schemas with neither skip the check entirely.
+fn any_checked_bounds(schema: &Schema, items: &[Decl]) -> bool {
     items.iter().any(|d| match d {
-        Decl::Repeat { body, .. } => any_dynamic_bounds(body),
+        Decl::Repeat { body, .. } => any_checked_bounds(schema, body),
+        Decl::Int { name, bounds } => {
+            bounds.is_dynamic()
+                || (schema.is_derived(name) && (bounds.lo.is_some() || bounds.hi.is_some()))
+        }
         other => decl_bounds(other).is_dynamic(),
     })
 }
 
-/// Is every dynamically bounded value still inside its range?
+/// Is every value that a deletion could invalidate still inside its range?
 ///
 /// This is the entire mechanism, and it is deliberately not a cascade. A
 /// numeric bound says nothing about *which* positions survive, so it induces no
@@ -1491,13 +1496,20 @@ fn any_dynamic_bounds(items: &[Decl]) -> bool {
 /// preserves identity: the same element, a new label. Clamping a magnitude
 /// from 7 to 3 preserves nothing, and would be a value edit smuggled into a
 /// structural pass without the oracle ever approving it as one.
-fn dynamic_bounds_hold(data: &SchemaData) -> bool {
+fn declared_bounds_hold(data: &SchemaData) -> bool {
     for path in data.all_sites() {
         let Some(decl) = decl_at(&data.schema.items, &path) else {
             continue;
         };
         let bounds = decl_bounds(decl);
-        if !bounds.is_dynamic() {
+        // A derived count follows its data, so a cascade can push it outside
+        // its declared range with no value ever being edited. `index I[K] into
+        // N` with `int K in 1..1` loses its only reference when `N` narrows and
+        // `K` falls to 0. `shrink_occurrence` enforces the floor on the
+        // occurrence it selects; nothing enforced it on the ones that selection
+        // drags along.
+        let derived_count = matches!(decl, Decl::Int { name, .. } if data.schema.is_derived(name));
+        if !bounds.is_dynamic() && !derived_count {
             continue;
         }
         let Some(block) = block_values_at(&data.values, &path[..path.len() - 1]) else {
@@ -1540,9 +1552,9 @@ impl SchemaData {
     /// and whole repeat iterations. Declared counts are recomputed after each
     /// accepted edit, and no count is taken below its declared minimum.
     pub fn structural_pass(&self, accept: &mut dyn FnMut(&SchemaData) -> bool) -> SchemaData {
-        let dynamic = any_dynamic_bounds(&self.schema.items);
+        let checked = any_checked_bounds(&self.schema, &self.schema.items);
         let accept: &mut dyn FnMut(&SchemaData) -> bool =
-            &mut |c: &SchemaData| (!dynamic || dynamic_bounds_hold(c)) && accept(c);
+            &mut |c: &SchemaData| (!checked || declared_bounds_hold(c)) && accept(c);
         let mut data = self.clone();
         // Every accepted edit strictly shrinks the input, so this terminates;
         // the counter only bounds pathological schemas.
@@ -1565,9 +1577,9 @@ impl SchemaData {
     /// Pull integers toward the legal value nearest zero. Derived counts are
     /// skipped: they follow the data, they do not lead it.
     pub fn value_pass(&self, accept: &mut dyn FnMut(&SchemaData) -> bool) -> SchemaData {
-        let dynamic = any_dynamic_bounds(&self.schema.items);
+        let checked = any_checked_bounds(&self.schema, &self.schema.items);
         let accept: &mut dyn FnMut(&SchemaData) -> bool =
-            &mut |c: &SchemaData| (!dynamic || dynamic_bounds_hold(c)) && accept(c);
+            &mut |c: &SchemaData| (!checked || declared_bounds_hold(c)) && accept(c);
         let mut data = self.clone();
         let schema = Rc::clone(&data.schema);
         for path in data.all_sites() {
@@ -2536,6 +2548,35 @@ array A[N] in 0..999
         );
     }
 
+    /// A count keeps its declared floor even when a *cascade* empties it, not
+    /// only when it is the occurrence being selected.
+    ///
+    /// Found by `proptest::every_schema_candidate_the_reducer_offers_re_parses`
+    /// on a generated schema, then cut down to this. Before the fix the reducer
+    /// emitted `K = 0` against `int K in 1..1` -- an input its own schema
+    /// rejects, which is the one thing `--schema` exists to prevent.
+    #[test]
+    fn a_cascade_cannot_take_a_count_below_its_declared_floor() {
+        let text = "int N in 1..10\narray A[N] in 0..99\nint K in 1..1\nindex I[K] into N\n";
+        let data = build(text, "2\n10 20\n1\n2\n");
+
+        // Dropping position 2 kills `I`'s only reference, so `K` would fall to
+        // zero. Projection still builds the candidate -- projection does not
+        // judge -- but it is recognised as invalid and never offered.
+        let (occ, all) = occurrence_for(&data, "N");
+        let kept = project_occurrence(&data, &occ, &[0], &all).expect("projects");
+        assert!(parse_input(&kept.schema, &kept.render()).is_err());
+        assert!(!declared_bounds_hold(&kept), "K = 0 is below `in 1..1`");
+
+        // End to end, with an oracle that accepts anything: whatever comes out
+        // has to satisfy the schema it was reduced against.
+        let out = reduce(&data, |_| true);
+        let rendered = out.render();
+        parse_input(&out.schema, &rendered).unwrap_or_else(|e| {
+            panic!("the reducer emitted an input its schema rejects: {rendered:?} -- {e}")
+        });
+    }
+
     // ---- dynamic numeric bounds -----------------------------------------
 
     /// 1. `array A[N] in 1..N` parses and round-trips unchanged.
@@ -2679,7 +2720,7 @@ repeat T {
         // wrong block would wave this candidate through.
         let kept = project_occurrence(&data, &instances[1], &[0], &all).expect("projects");
         assert_eq!(ints(&kept.render()), vec![2, 5, 1, 1, 1, 1, 1, 1, 2]);
-        assert!(!dynamic_bounds_hold(&kept), "2 is out of range for N = 1");
+        assert!(!declared_bounds_hold(&kept), "2 is out of range for N = 1");
     }
 
     /// 7. A range may only name an `int` declared earlier in the same block.
@@ -2727,7 +2768,12 @@ repeat T {
         assert_eq!(literal.resolve(&[]), literal.resolve(&[Value::Int(1)]));
 
         let text = "int N in 1..10\narray A[N] in 1..5\n";
-        assert!(!any_dynamic_bounds(&parse_schema(text).unwrap().items));
+        let schema = parse_schema(text).unwrap();
+        // No range here names a count ...
+        assert!(!schema.items.iter().any(|d| decl_bounds(d).is_dynamic()));
+        // ... but `N` is a derived count with a floor, so candidates are still
+        // checked: a cascade can empty a count without editing any value.
+        assert!(any_checked_bounds(&schema, &schema.items));
     }
 
     /// 10. `index I[K] into N` and `int X in 1..N` both mention `N` and mean
@@ -2760,7 +2806,7 @@ repeat T {
         // are magnitudes and stay 4 -- which is now out of range, so the
         // candidate exists but the guard withholds it.
         assert_eq!(ints(&kept.render()), vec![2, 1, 2, 4, 4]);
-        assert!(!dynamic_bounds_hold(&kept));
+        assert!(!declared_bounds_hold(&kept));
     }
 
     /// 12. Three identity producers and a numeric bound in one schema. The

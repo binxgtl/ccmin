@@ -308,6 +308,337 @@ impl Judge for PredicateJudge<'_> {
     }
 }
 
+// ---- schema generation --------------------------------------------------
+
+/// One declaration in a generated block.
+///
+/// The schema text and a conforming input are produced from the same list, so
+/// the input is right by construction rather than by re-implementing the
+/// reader inside its own test.
+enum Item {
+    Count {
+        name: String,
+        lo: usize,
+        hi: usize,
+    },
+    Array {
+        name: String,
+        len: String,
+        lo: i64,
+        hi: i64,
+    },
+    /// `array A[N] in 1..N` -- magnitudes bounded by a count.
+    DynArray {
+        name: String,
+        len: String,
+    },
+    Matrix {
+        name: String,
+        rows: String,
+        cols: String,
+    },
+    Perm {
+        name: String,
+        len: String,
+    },
+    Index {
+        name: String,
+        len: String,
+        target: String,
+    },
+    Graph {
+        name: String,
+        edges: String,
+        verts: String,
+    },
+    Tree {
+        name: String,
+        verts: String,
+    },
+    /// `array W[P.values]` -- follows a permutation's codomain. `len` is the
+    /// count behind it, needed only to know how many values to emit.
+    PermValues {
+        name: String,
+        perm: String,
+        len: String,
+    },
+    Repeat {
+        count: String,
+        body: Vec<Item>,
+    },
+}
+
+fn decl_text(item: &Item, out: &mut String, indent: &str) {
+    match item {
+        Item::Count { name, lo, hi } => {
+            out.push_str(&format!("{indent}int {name} in {lo}..{hi}\n"));
+        }
+        Item::Array { name, len, lo, hi } => {
+            out.push_str(&format!("{indent}array {name}[{len}] in {lo}..{hi}\n"));
+        }
+        Item::DynArray { name, len } => {
+            out.push_str(&format!("{indent}array {name}[{len}] in 1..{len}\n"));
+        }
+        Item::Matrix { name, rows, cols } => {
+            out.push_str(&format!("{indent}matrix {name}[{rows}][{cols}] in 0..9\n"));
+        }
+        Item::Perm { name, len } => {
+            out.push_str(&format!("{indent}permutation {name}[{len}]\n"));
+        }
+        Item::Index { name, len, target } => {
+            out.push_str(&format!("{indent}index {name}[{len}] into {target}\n"));
+        }
+        Item::Graph { name, edges, verts } => {
+            out.push_str(&format!("{indent}graph {name}[{edges}] vertices {verts}\n"));
+        }
+        Item::Tree { name, verts } => {
+            out.push_str(&format!("{indent}tree {name} vertices {verts}\n"));
+        }
+        Item::PermValues { name, perm, .. } => {
+            out.push_str(&format!("{indent}array {name}[{perm}.values] in 0..99\n"));
+        }
+        Item::Repeat { count, body } => {
+            out.push_str(&format!("{indent}repeat {count} {{\n"));
+            for inner in body {
+                decl_text(inner, out, "  ");
+            }
+            out.push_str(&format!("{indent}}}\n"));
+        }
+    }
+}
+
+/// Emit data for one instantiation of a block, recording count values as it
+/// goes. Reading is linear, so a count is always known before it is used.
+fn emit_data(items: &[Item], rng: &mut Rng, counts: &mut Vec<(String, usize)>, out: &mut String) {
+    let get = |counts: &Vec<(String, usize)>, name: &str| -> usize {
+        counts
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+            .unwrap_or(1)
+    };
+    for item in items {
+        match item {
+            Item::Count { name, lo, hi } => {
+                let v = rng.range(*lo, *hi);
+                counts.push((name.clone(), v));
+                out.push_str(&format!("{v}\n"));
+            }
+            Item::Array { len, lo, hi, .. } => {
+                let n = get(counts, len);
+                let span = (hi - lo + 1).max(1) as usize;
+                let vals: Vec<String> = (0..n)
+                    .map(|_| (lo + rng.below(span) as i64).to_string())
+                    .collect();
+                out.push_str(&format!("{}\n", vals.join(" ")));
+            }
+            Item::DynArray { len, .. } => {
+                let n = get(counts, len);
+                let vals: Vec<String> = (0..n).map(|_| rng.range(1, n).to_string()).collect();
+                out.push_str(&format!("{}\n", vals.join(" ")));
+            }
+            Item::Matrix { rows, cols, .. } => {
+                let (r, c) = (get(counts, rows), get(counts, cols));
+                for _ in 0..r {
+                    let row: Vec<String> = (0..c).map(|_| rng.below(10).to_string()).collect();
+                    out.push_str(&format!("{}\n", row.join(" ")));
+                }
+            }
+            Item::Perm { len, .. } => {
+                let n = get(counts, len);
+                let mut v: Vec<usize> = (1..=n).collect();
+                for i in (1..v.len()).rev() {
+                    v.swap(i, rng.below(i + 1));
+                }
+                let vals: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+                out.push_str(&format!("{}\n", vals.join(" ")));
+            }
+            Item::Index { len, target, .. } => {
+                let (k, t) = (get(counts, len), get(counts, target));
+                let vals: Vec<String> = (0..k).map(|_| rng.range(1, t).to_string()).collect();
+                out.push_str(&format!("{}\n", vals.join(" ")));
+            }
+            Item::Graph { edges, verts, .. } => {
+                let (m, n) = (get(counts, edges), get(counts, verts));
+                for _ in 0..m {
+                    out.push_str(&format!("{} {}\n", rng.range(1, n), rng.range(1, n)));
+                }
+            }
+            Item::PermValues { len, .. } => {
+                let n = get(counts, len);
+                let vals: Vec<String> = (0..n).map(|_| rng.below(100).to_string()).collect();
+                out.push_str(&format!("{}\n", vals.join(" ")));
+            }
+            Item::Tree { verts, .. } => {
+                let n = get(counts, verts);
+                for child in 2..=n {
+                    out.push_str(&format!("{} {}\n", rng.range(1, child - 1), child));
+                }
+            }
+            Item::Repeat { count, body } => {
+                let t = get(counts, count);
+                for _ in 0..t {
+                    let depth = counts.len();
+                    emit_data(body, rng, counts, out);
+                    counts.truncate(depth);
+                }
+            }
+        }
+    }
+}
+
+/// Build a block whose declarations are valid by construction: a count exists
+/// before anything is sized by it, an `index` or `permutation` only targets a
+/// count that already sizes something, and no count carries two permutations.
+fn gen_block(rng: &mut Rng, id: &mut usize, nested: bool) -> Vec<Item> {
+    let mut items = Vec::new();
+    let mut sized: Vec<String> = Vec::new();
+    let mut permuted: HashSet<String> = HashSet::new();
+
+    let base = {
+        *id += 1;
+        format!("N{id}")
+    };
+    items.push(Item::Count {
+        name: base.clone(),
+        lo: 1,
+        hi: rng.range(2, 6),
+    });
+    items.push(Item::Array {
+        name: format!("A{id}"),
+        len: base.clone(),
+        lo: 0,
+        hi: 99,
+    });
+    sized.push(base.clone());
+
+    for _ in 0..rng.range(1, 4) {
+        *id += 1;
+        let name = format!("X{id}");
+        let target = sized[rng.below(sized.len())].clone();
+        match rng.below(if nested { 6 } else { 9 }) {
+            0 => items.push(Item::Array {
+                name,
+                len: target,
+                lo: -50,
+                hi: 50,
+            }),
+            1 => items.push(Item::DynArray { name, len: target }),
+            2 if !permuted.contains(&target) => {
+                permuted.insert(target.clone());
+                items.push(Item::Perm {
+                    name: name.clone(),
+                    len: target.clone(),
+                });
+                // Half the time, hang an array off the codomain as well.
+                if rng.below(2) == 0 {
+                    *id += 1;
+                    items.push(Item::PermValues {
+                        name: format!("W{id}"),
+                        perm: name,
+                        len: target,
+                    });
+                }
+            }
+            3 => {
+                *id += 1;
+                let k = format!("K{id}");
+                items.push(Item::Count {
+                    name: k.clone(),
+                    lo: 1,
+                    hi: rng.range(1, 4),
+                });
+                items.push(Item::Index {
+                    name,
+                    len: k.clone(),
+                    target,
+                });
+                sized.push(k);
+            }
+            4 => {
+                *id += 1;
+                let m = format!("M{id}");
+                items.push(Item::Count {
+                    name: m.clone(),
+                    lo: 1,
+                    hi: rng.range(1, 4),
+                });
+                items.push(Item::Graph {
+                    name,
+                    edges: m.clone(),
+                    verts: target,
+                });
+                sized.push(m);
+            }
+            5 => {
+                *id += 1;
+                let c = format!("C{id}");
+                items.push(Item::Count {
+                    name: c.clone(),
+                    lo: 1,
+                    hi: rng.range(1, 3),
+                });
+                items.push(Item::Matrix {
+                    name,
+                    rows: target,
+                    cols: c.clone(),
+                });
+                sized.push(c);
+            }
+            6 => {
+                *id += 1;
+                let t = format!("T{id}");
+                items.push(Item::Count {
+                    name: t.clone(),
+                    lo: 1,
+                    hi: rng.range(1, 3),
+                });
+                items.push(Item::Repeat {
+                    count: t,
+                    body: gen_block(rng, id, true),
+                });
+            }
+            7 => {
+                // A tree needs at least two vertices, and its own count so the
+                // rest of the block is unaffected by the connectivity rule.
+                *id += 1;
+                let v = format!("V{id}");
+                items.push(Item::Count {
+                    name: v.clone(),
+                    lo: 2,
+                    hi: rng.range(2, 6),
+                });
+                items.push(Item::Tree {
+                    name,
+                    verts: v.clone(),
+                });
+                sized.push(v);
+            }
+            _ => items.push(Item::Array {
+                name,
+                len: target,
+                lo: 1,
+                hi: 1000,
+            }),
+        }
+    }
+    items
+}
+
+/// A schema and an input that satisfies it.
+fn gen_schema_case(rng: &mut Rng) -> (String, String) {
+    let mut id = 0usize;
+    let items = gen_block(rng, &mut id, false);
+    let mut text = String::new();
+    for item in &items {
+        decl_text(item, &mut text, "");
+    }
+    let mut input = String::new();
+    emit_data(&items, rng, &mut Vec::new(), &mut input);
+    (text, input)
+}
+
 // ---- properties ---------------------------------------------------------
 
 #[test]
@@ -464,5 +795,230 @@ fn graph_vertex_compaction_leaves_no_gaps() {
                 induced.n
             );
         }
+    }
+}
+
+// ---- schema properties --------------------------------------------------
+
+/// Asserts the reducer's central promise on *every* candidate it constructs,
+/// not merely on the one it returns: a rendered candidate always re-parses
+/// under the same schema. Dangling references, a broken permutation, a count
+/// out of step with its data, or a value outside a count-referenced range
+/// would all surface here.
+struct SchemaJudge<'a> {
+    schema: &'a std::rc::Rc<crate::schema::Schema>,
+    predicate: &'a dyn Fn(&str) -> bool,
+    seed: u64,
+    seen: usize,
+}
+
+impl Judge for SchemaJudge<'_> {
+    fn preserves(&mut self, input: &str, _target: FailKind) -> std::io::Result<bool> {
+        self.seen += 1;
+        if let Err(e) = crate::schema::parse_input(self.schema, input) {
+            panic!(
+                "seed {}: the reducer offered an input that does not parse: {e}\n\
+                 --- schema ---\n{}\n--- candidate ---\n{input}",
+                self.seed,
+                self.schema_text()
+            );
+        }
+        Ok((self.predicate)(input))
+    }
+}
+
+impl SchemaJudge<'_> {
+    fn schema_text(&self) -> String {
+        "(see the failing seed)".into()
+    }
+}
+
+fn schema_model(text: &str, input: &str) -> Option<(Model, std::rc::Rc<crate::schema::Schema>)> {
+    let schema = crate::schema::parse_schema(text).ok()?;
+    let options = crate::model::ParseOptions {
+        shape: crate::model::Shape::Auto,
+        n_index: None,
+        schema: Some(std::rc::Rc::clone(&schema)),
+        guess_header: false,
+    };
+    let model = crate::model::parse_with(input, options).ok()?;
+    Some((model, schema))
+}
+
+#[test]
+fn generated_schemas_and_inputs_agree() {
+    let mut built = 0;
+    for seed in 0..CASES {
+        let mut rng = Rng::new(seed ^ 0x5C4E);
+        let (text, input) = gen_schema_case(&mut rng);
+        let schema = crate::schema::parse_schema(&text).unwrap_or_else(|e| {
+            panic!("seed {seed}: generated schema does not parse: {e}\n{text}")
+        });
+        let data = crate::schema::parse_input(&schema, &input).unwrap_or_else(|e| {
+            panic!("seed {seed}: generated input does not parse: {e}\n{text}\n---\n{input}")
+        });
+        assert_eq!(
+            data.render(),
+            input,
+            "seed {seed}: render is not the identity on a freshly read input\n{text}"
+        );
+        built += 1;
+    }
+    assert!(built > 0, "the generator produced nothing");
+}
+
+#[test]
+fn every_schema_candidate_the_reducer_offers_re_parses() {
+    let mut exercised = 0;
+    for seed in 0..CASES {
+        let mut rng = Rng::new(seed ^ 0xA17E);
+        let (text, input) = gen_schema_case(&mut rng);
+        let Some((model, schema)) = schema_model(&text, &input) else {
+            continue;
+        };
+        let k = rng.range(1, 6);
+        let predicate = predicate(rng.below(5), k);
+        if !predicate(&model.render()) {
+            continue;
+        }
+        let mut judge = SchemaJudge {
+            schema: &schema,
+            predicate: predicate.as_ref(),
+            seed,
+            seen: 0,
+        };
+        let mut on_step = |_: &Model| {};
+        let mut shrinker = Shrinker::new(&mut judge, FailKind::WrongAnswer, &mut on_step);
+        let (reduced, _) = shrinker
+            .run(&model)
+            .unwrap_or_else(|e| panic!("seed {seed}: reduction failed: {e}\n{text}"));
+
+        let out = reduced.render();
+        crate::schema::parse_input(&schema, &out).unwrap_or_else(|e| {
+            panic!("seed {seed}: the reduced input does not parse: {e}\n{text}\n---\n{out}")
+        });
+        assert!(
+            predicate(&out),
+            "seed {seed}: the reduced input no longer satisfies the predicate\n{text}\n---\n{out}"
+        );
+        exercised += 1;
+    }
+    assert!(
+        exercised > CASES as usize / 4,
+        "only {exercised} schema reductions ran; the generator or the filter is too strict"
+    );
+}
+
+#[test]
+fn schema_reduction_never_grows_the_input() {
+    for seed in 0..CASES {
+        let mut rng = Rng::new(seed ^ 0x9B21);
+        let (text, input) = gen_schema_case(&mut rng);
+        let Some((model, _)) = schema_model(&text, &input) else {
+            continue;
+        };
+        let before = model.render().split_whitespace().count();
+        let k = rng.range(1, 6);
+        let predicate = predicate(rng.below(5), k);
+        if !predicate(&model.render()) {
+            continue;
+        }
+        let mut judge = PredicateJudge {
+            predicate: predicate.as_ref(),
+        };
+        let mut on_step = |_: &Model| {};
+        let mut shrinker = Shrinker::new(&mut judge, FailKind::WrongAnswer, &mut on_step);
+        let (reduced, _) = shrinker.run(&model).expect("pure predicate cannot error");
+        let after = reduced.render().split_whitespace().count();
+        assert!(
+            after <= before,
+            "seed {seed}: reduction grew the input from {before} to {after}\n{text}"
+        );
+    }
+}
+
+/// A schema file is user input and may be anything at all. Every outcome must
+/// be an error, never a panic and never a hang.
+#[test]
+fn malformed_schema_text_is_rejected_not_fatal() {
+    const WORDS: &[&str] = &[
+        "int",
+        "array",
+        "matrix",
+        "tree",
+        "graph",
+        "index",
+        "permutation",
+        "repeat",
+        "in",
+        "into",
+        "vertices",
+        "{",
+        "}",
+        "[",
+        "]",
+        "..",
+        "N",
+        "A",
+        "0",
+        "1",
+        "-1",
+        "999999999999999999999",
+        "#",
+        ".values",
+        "[]",
+        "[N]",
+        "[N][M]",
+        "1..N",
+        "..",
+        "N..1",
+        "",
+        "\t",
+    ];
+    for seed in 0..CASES * 4 {
+        let mut rng = Rng::new(seed ^ 0xDEAD);
+        let lines = rng.range(1, 6);
+        let mut text = String::new();
+        for _ in 0..lines {
+            let n = rng.range(1, 6);
+            let toks: Vec<&str> = (0..n).map(|_| WORDS[rng.below(WORDS.len())]).collect();
+            text.push_str(&toks.join(" "));
+            text.push('\n');
+        }
+        // Whatever comes back, it must be a value and not a crash.
+        if let Ok(schema) = crate::schema::parse_schema(&text) {
+            // A schema that parsed must also survive arbitrary input safely.
+            let _ = crate::schema::parse_input(&schema, "1 2 3\n4 5 6\n");
+            let _ = crate::schema::parse_input(&schema, "");
+        }
+    }
+}
+
+/// The same for the data file, against a schema that is known good.
+#[test]
+fn malformed_input_is_rejected_not_fatal() {
+    let schemas = [
+        "int N in 1..10\narray A[N] in 1..N\n",
+        "int N in 1..10\nint M in 0..20\ngraph E[M] vertices N\nindex I[M] into N\n",
+        "int N in 2..10\ntree E vertices N\narray C[N] in 0..9\n",
+        "int N in 1..10\npermutation P[N]\narray W[P.values] in 0..99\n",
+        "int T in 1..3\nrepeat T {\n  int N in 1..5\n  array A[N] in 1..N\n}\n",
+    ];
+    for seed in 0..CASES * 4 {
+        let mut rng = Rng::new(seed ^ 0xBEEF);
+        let schema = crate::schema::parse_schema(schemas[rng.below(schemas.len())])
+            .expect("fixture schemas parse");
+        let n = rng.below(14);
+        let toks: Vec<String> = (0..n)
+            .map(|_| match rng.below(6) {
+                0 => rng.value().to_string(),
+                1 => rng.range(0, 6).to_string(),
+                2 => "0".into(),
+                3 => "-1".into(),
+                4 => i64::MIN.to_string(),
+                _ => "x".into(),
+            })
+            .collect();
+        let _ = crate::schema::parse_input(&schema, &toks.join(" "));
     }
 }

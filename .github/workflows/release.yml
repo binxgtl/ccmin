@@ -96,7 +96,13 @@ jobs:
           Copy-Item README.md, LICENSE $stage
           Compress-Archive -Path $stage -DestinationPath "dist/${{ matrix.asset }}.zip"
           $hash = (Get-FileHash "dist/${{ matrix.asset }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  ${{ matrix.asset }}.zip" | Set-Content "dist/${{ matrix.asset }}.zip.sha256" -Encoding ascii
+          # Written byte for byte with a single LF. `Set-Content` ends the line
+          # with CRLF on Windows, which makes `sha256sum -c` on a Unix-like
+          # system read the trailing CR as part of the filename and fail to
+          # find the file. The four tar.gz sidecars are produced by sha256sum
+          # itself and already use LF.
+          $line = "$hash  ${{ matrix.asset }}.zip`n"
+          [IO.File]::WriteAllText("$PWD/dist/${{ matrix.asset }}.zip.sha256", $line)
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.asset }}
