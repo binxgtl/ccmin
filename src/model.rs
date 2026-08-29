@@ -348,6 +348,45 @@ pub fn parse_with(text: &str, options: ParseOptions) -> Result<Model, String> {
     Ok(Model::Raw(lines))
 }
 
+/// When auto-detection has fallen back to raw, is there a shape the input
+/// *would* match if it were asked for by name?
+///
+/// Detection stays conservative on purpose: guessing `graph` wrongly would
+/// reduce confidently into a structure the problem does not have, which is
+/// worse than reducing honestly at token level. But staying silent leaves the
+/// structural reducers undiscoverable -- ccmin's own `tree` and `graph`
+/// fixtures land in raw mode -- so the difference is offered to the user
+/// instead of taken on their behalf.
+///
+/// Only shapes whose parser *validates* something are suggested. `tree`
+/// checks connectivity and acyclicity, `multitest` checks that every block
+/// lines up, and `graph` checks that the edge count is exact and every
+/// endpoint is in range. `--guess-header` is deliberately not suggested: it
+/// matches on arithmetic alone across five header positions, so almost any
+/// integer soup satisfies one of them, and pointing a user at it would be
+/// noise at best and a wrong reduction at worst.
+pub fn suggest_shape(text: &str) -> Option<&'static str> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let ints: Vec<i64> = tokens
+        .iter()
+        .map(|t| t.parse::<i64>().ok())
+        .collect::<Option<_>>()?;
+
+    if try_tree(&ints).is_some() {
+        return Some("--shape tree");
+    }
+    if try_multitest(&ints).is_some() {
+        return Some("--shape multitest");
+    }
+    if try_graph(&ints).is_some() {
+        return Some("--shape graph");
+    }
+    None
+}
+
 fn shape_label(shape: Shape) -> &'static str {
     match shape {
         Shape::Auto => "auto",
@@ -579,6 +618,52 @@ mod tests {
         // This graph-like input used to false-positive as an array because the
         // first of three guessed header values happened to equal the tail.
         assert!(parse("3 2\n1 2\n2 3\n").is_raw());
+    }
+
+    /// Auto-detection stays conservative, so the structural shapes have to be
+    /// discoverable some other way. These are the inputs ccmin's own fixtures
+    /// produce, which fell back to raw token shrinking with no explanation.
+    #[test]
+    fn a_raw_fallback_names_the_shape_that_would_have_matched() {
+        // The `tree` fixture: 8 vertices, 7 edges around a star at 2.
+        let tree = "8\n2 1\n2 3\n2 4\n2 5\n2 6\n2 7\n2 8\n";
+        assert_eq!(suggest_shape(tree), Some("--shape tree"));
+
+        // The `graph` fixture: `N M` then M edges.
+        let graph = "7 5\n2 3\n3 4\n4 2\n5 6\n6 7\n";
+        assert_eq!(suggest_shape(graph), Some("--shape graph"));
+
+        // A multitest: T, then T blocks of N followed by N values.
+        assert_eq!(
+            suggest_shape("2\n3\n1 2 3\n1\n9\n"),
+            Some("--shape multitest")
+        );
+    }
+
+    /// It must stay quiet when there is nothing to suggest, or the hint is
+    /// just noise attached to every raw reduction.
+    #[test]
+    fn no_shape_is_suggested_when_none_fits() {
+        // Non-integer input: genuinely raw, like the `strings` fixture.
+        assert_eq!(suggest_shape("abc\nde f\n"), None);
+        assert_eq!(suggest_shape(""), None);
+        assert_eq!(suggest_shape("   \n"), None);
+        // Integers that form no shape: 9 vertices with 4 declared edges, but
+        // only two pairs follow.
+        assert_eq!(suggest_shape("9 4\n1 2\n3 4\n"), None);
+        // An endpoint outside 1..=N is not a graph.
+        assert_eq!(suggest_shape("2 1\n1 9\n"), None);
+        // Numeric coincidence alone is not enough: this matches an array with
+        // a three-value header, which is exactly what is not suggested.
+        assert_eq!(suggest_shape("3 9\n10 20 30\n"), None);
+    }
+
+    /// A tree is checked for connectivity, so a disconnected edge set with the
+    /// right count is not mistaken for one.
+    #[test]
+    fn a_disconnected_edge_set_is_not_suggested_as_a_tree() {
+        // 4 vertices, 3 edges, but 1-2, 3-4 and 3-4 again: a cycle and a split.
+        assert_eq!(suggest_shape("4\n1 2\n3 4\n3 4\n"), None);
     }
 
     #[test]

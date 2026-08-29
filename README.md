@@ -139,7 +139,18 @@ ccmin --guess-header                # also guess 2-3 field array headers
 ```
 
 Tree and graph shapes are explicit-only: auto mode never selects these models,
-so pass the corresponding `--shape` flag. Tree shrinking prunes leaves,
+so pass the corresponding `--shape` flag. You do not have to notice this
+yourself — when auto mode falls back to raw and the input *would* match a shape
+whose parser validates it, ccmin names the flag:
+
+```
+note: input shape not recognised; shrinking at token level (...)
+hint: this input matches `--shape tree`; re-running with it reduces
+      structurally and keeps the result valid.
+```
+
+`--guess-header` is never suggested this way: it matches on arithmetic alone,
+so almost any integer soup satisfies one of its header positions. Tree shrinking prunes leaves,
 preserving connectivity and acyclicity. Graph
 shrinking deletes edges and induced vertex subsets, compacts labels back to
 `1..=N`, and re-renders both `N` and `M` after every accepted edit.

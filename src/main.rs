@@ -232,6 +232,18 @@ fn run() -> Result<bool, String> {
             "input shape not recognised; shrinking at token level (result may not satisfy the problem's constraints)"
         };
         println!("      {}", term::yellow(&format!("note: {reason}")));
+        // Auto-detection will not guess a structure on the user's behalf, but
+        // it can say which flag would have found one.
+        if args.shape == Shape::Auto {
+            if let Some(flag) = model::suggest_shape(&input) {
+                println!(
+                    "      {} this input matches `{}`; re-running with it reduces \
+                     structurally and keeps the result valid.",
+                    term::yellow("hint:"),
+                    flag
+                );
+            }
+        }
     } else if args.shape == Shape::Auto
         && args.guess_header
         && matches!(&parsed, Model::Array(c) if c.header.len() > 1)
