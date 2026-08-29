@@ -3,6 +3,37 @@
 Notable changes per release. Earlier releases (0.1.0 – 0.4.0) predate this file;
 see the git tags and the GitHub releases page for those.
 
+## Unreleased
+
+### Correctness fixes
+
+- **A count kept by a cascade no longer drops below its declared minimum.**
+  With `int K in 1..1` and `index I[K] into N`, deleting a position of `N`
+  killed the only reference `I` held, so `K` fell to 0 and ccmin emitted an
+  input its own schema rejects — the one thing `--schema` exists to prevent.
+  The floor was enforced on the occurrence being selected but not on the ones
+  that selection dragged along. Such candidates are now rejected rather than
+  repaired, and reduction offers a different deletion instead.
+
+### Usability
+
+- **A raw fallback now names the shape that would have matched.** Auto-detection
+  still refuses to guess `tree` or `graph`, but when the input would satisfy one
+  of the validating parsers it says which `--shape` flag to use. ccmin's own
+  tree and graph fixtures previously landed in token-level reduction with no
+  explanation.
+
+### Internal
+
+- The schema pipeline gained randomised property testing, which is what found
+  the bug above. A generator builds a schema and a conforming input from one
+  description, and the suite asserts that every candidate the reducer offers
+  re-parses — not merely the one it returns.
+- The Windows checksum sidecar is written with an explicit LF. `Set-Content`
+  ended the line with CRLF, which made `sha256sum -c` on Unix-like systems read
+  the trailing carriage return as part of the filename. Hash bytes were always
+  correct; only the sidecar formatting was wrong.
+
 ## 0.5.0
 
 The schema language learns to describe how the parts of an input depend on one
